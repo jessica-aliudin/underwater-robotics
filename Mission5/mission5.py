@@ -1,7 +1,11 @@
 """Mission 5: find the coloured poles and hit them in the referee's order.
 
-Run:
-    python mission5.py --order R-B-Y --camera 1
+Run one of the three modes:
+    python mission5.py --mode camera --camera 0
+    python mission5.py --mode tune --camera 0
+    python mission5.py --mode mission --order R-B-Y --camera 0
+
+All Mission 5 runtime tools are intentionally kept in this one file.
 
 The ROV starts PAUSED. Press SPACE to start moving.
 
@@ -25,12 +29,170 @@ For each pole the controller runs:
 """
 
 import argparse
+import json
+import os
 import time
 from dataclasses import dataclass
 
 import cv2
+import numpy as np
 
-from pole_detector import COLORS, DRAW_BGR, PoleDetector, draw_detections, load_config
+
+# ---------------------------------------------------------------------------
+# Colour-pole detection
+# ---------------------------------------------------------------------------
+
+COLORS = ("red", "yellow", "blue")
+DRAW_BGR = {"red": (0, 0, 255), "yellow": (0, 220, 255), "blue": (255, 80, 0)}
+
+# OpenCV HSV uses H 0-179 and S/V 0-255. Red wraps around hue zero, so it
+# needs two ranges.
+DEFAULT_CONFIG = {
+    "white_balance": True,
+    "blur_ksize": 5,
+    "min_area_frac": 0.001,
+    "max_area_frac": 0.90,
+    "min_aspect": 1.3,
+    "ranges": {
+        "red": [[[0, 110, 60], [8, 255, 255]], [[165, 110, 60], [179, 255, 255]]],
+        "yellow": [[[15, 100, 90], [40, 255, 255]]],
+        "blue": [[[100, 130, 50], [128, 255, 255]]],
+    },
+}
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "colors.json")
+
+
+@dataclass
+class Detection:
+    color: str
+    bbox: tuple
+    center: tuple
+    area: float
+    err_x: float
+    err_y: float
+    height_frac: float
+    width_frac: float
+    area_frac: float
+    score: float
+
+
+def load_config(path=CONFIG_PATH):
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if path and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            user = json.load(f)
+        ranges = user.pop("ranges", {})
+        cfg.update(user)
+        cfg["ranges"].update(ranges)
+    return cfg
+
+
+def save_config(cfg, path=CONFIG_PATH):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def white_balance_gains(bgr):
+    sample = bgr[::4, ::4].reshape(-1, 3)
+    med = np.median(sample, axis=0).astype(np.float32)
+    gain = med.mean() / np.maximum(med, 1.0)
+    return np.clip(gain, 0.5, 3.0)
+
+
+def gray_world_white_balance(bgr, gain=None):
+    if gain is None:
+        gain = white_balance_gains(bgr)
+    lut = np.clip(np.arange(256, dtype=np.float32)[:, None] * gain[None, :], 0, 255)
+    return cv2.LUT(bgr, lut.astype(np.uint8).reshape(1, 256, 3))
+
+
+class PoleDetector:
+    def __init__(self, config=None):
+        self.cfg = config if config is not None else load_config()
+        self._wb_gain = None
+        self._open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        self._close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 21))
+
+    def preprocess(self, bgr):
+        if self.cfg.get("white_balance", True):
+            gain = white_balance_gains(bgr)
+            self._wb_gain = gain if self._wb_gain is None else 0.9 * self._wb_gain + 0.1 * gain
+            bgr = gray_world_white_balance(bgr, self._wb_gain)
+        ksize = int(self.cfg.get("blur_ksize", 5))
+        if ksize >= 3:
+            bgr = cv2.GaussianBlur(bgr, (ksize | 1, ksize | 1), 0)
+        return bgr
+
+    def mask(self, hsv, color):
+        mask = None
+        for lower, upper in self.cfg["ranges"][color]:
+            part = cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8))
+            mask = part if mask is None else cv2.bitwise_or(mask, part)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._open_k)
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._close_k)
+
+    def detect(self, bgr, return_masks=False):
+        height, width = bgr.shape[:2]
+        frame_area = float(height * width)
+        hsv = cv2.cvtColor(self.preprocess(bgr), cv2.COLOR_BGR2HSV)
+        results, masks = {}, {}
+        for color in COLORS:
+            mask = self.mask(hsv, color)
+            masks[color] = mask
+            results[color] = self._best_blob(mask, color, width, height, frame_area)
+        return (results, masks) if return_masks else results
+
+    def _best_blob(self, mask, color, width, height, frame_area):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            area_frac = area / frame_area
+            if area_frac < self.cfg["min_area_frac"] or area_frac > self.cfg["max_area_frac"]:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect = h / max(w, 1)
+            touches_edge = y <= 2 or y + h >= height - 2
+            if aspect < self.cfg["min_aspect"] and not touches_edge:
+                continue
+            solidity = area / max(w * h, 1)
+            score = area * (0.5 + solidity) * min(aspect, 6.0)
+            if best is None or score > best.score:
+                center_x, center_y = x + w / 2.0, y + h / 2.0
+                best = Detection(
+                    color=color,
+                    bbox=(x, y, w, h),
+                    center=(center_x, center_y),
+                    area=area,
+                    err_x=(center_x - width / 2.0) / (width / 2.0),
+                    err_y=(center_y - height / 2.0) / (height / 2.0),
+                    height_frac=h / float(height),
+                    width_frac=w / float(width),
+                    area_frac=area_frac,
+                    score=score,
+                )
+        return best
+
+
+def draw_detections(frame, detections, target=None):
+    for color, detection in detections.items():
+        if detection is None:
+            continue
+        x, y, w, h = detection.bbox
+        thickness = 4 if color == target else 1
+        cv2.rectangle(frame, (x, y), (x + w, y + h), DRAW_BGR[color], thickness)
+        label = f"{color} w={detection.width_frac:.2f}"
+        cv2.putText(
+            frame,
+            label,
+            (x, max(15, y - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            DRAW_BGR[color],
+            2 if color == target else 1,
+        )
+    return frame
 
 LETTER_TO_COLOR = {"R": "red", "Y": "yellow", "B": "blue"}
 
@@ -286,25 +448,143 @@ def mask_view(masks, size):
 
 
 def open_source(src):
-    if src.isdigit():
-        cap = cv2.VideoCapture(int(src), cv2.CAP_DSHOW)  # DSHOW opens fast on Windows
+    source = str(src)
+    if source.isdigit():
+        cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)  # DSHOW opens fast on Windows
         if not cap.isOpened():
-            cap = cv2.VideoCapture(int(src))
+            cap.release()
+            cap = cv2.VideoCapture(int(source))
     else:
-        cap = cv2.VideoCapture(src)
+        cap = cv2.VideoCapture(source)
     return cap
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Mission 5 colour pole hitting")
-    ap.add_argument("--order", help="referee order, e.g. R-B-Y (asked for if omitted)")
-    ap.add_argument("--camera", default="0", help="camera index or video file path (default 0)")
-    ap.add_argument("--auto-confirm", action="store_true",
-                    help="assume the ball dropped after each hit (no y/n needed)")
-    ap.add_argument("--record", help="save the raw camera video to this .mp4 (for tuning later)")
-    ap.add_argument("--no-gui", action="store_true",
-                    help="no window; starts running immediately, Ctrl+C to stop (implies --auto-confirm)")
-    args = ap.parse_args()
+def run_camera_test(camera):
+    """Open one camera at a time and show its raw live feed."""
+    cap = open_source(camera)
+    if not cap.isOpened():
+        cap.release()
+        raise SystemExit(f"Could not open camera {camera!r}")
+
+    print(f"Camera {camera} is working. Press Q to quit.")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("Could not read a frame from the camera.")
+                break
+            cv2.imshow("Mission 5 - Camera Test", frame)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+TUNER_WINDOW = "Mission 5 - HSV Tuner"
+TUNER_SLIDERS = ("H min", "H max", "S min", "S max", "V min", "V max")
+
+
+def _set_tuner_sliders(color_range):
+    (h0, s0, v0), (h1, s1, v1) = color_range
+    for name, value in zip(TUNER_SLIDERS, (h0, h1, s0, s1, v0, v1)):
+        cv2.setTrackbarPos(name, TUNER_WINDOW, int(value))
+
+
+def _read_tuner_sliders():
+    h0, h1, s0, s1, v0, v1 = (
+        cv2.getTrackbarPos(name, TUNER_WINDOW) for name in TUNER_SLIDERS
+    )
+    return [[h0, s0, v0], [h1, s1, v1]]
+
+
+def run_hsv_tuner(camera):
+    """Tune red/yellow/blue HSV ranges using the live camera."""
+    config = load_config()
+    detector = PoleDetector(config)
+    cap = open_source(camera)
+    if not cap.isOpened():
+        cap.release()
+        raise SystemExit(f"Could not open camera/video {camera!r}")
+
+    cv2.namedWindow(TUNER_WINDOW)
+    for name in TUNER_SLIDERS:
+        maximum = 179 if name.startswith("H") else 255
+        cv2.createTrackbar(name, TUNER_WINDOW, 0, maximum, lambda _value: None)
+
+    current = "red"
+    _set_tuner_sliders(config["ranges"][current][0])
+    state = {"click": None}
+
+    def on_mouse(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            state["click"] = (x, y)
+
+    cv2.setMouseCallback(TUNER_WINDOW, on_mouse)
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("Could not read a frame from the camera.")
+                break
+            hsv = cv2.cvtColor(detector.preprocess(frame), cv2.COLOR_BGR2HSV)
+
+            if state["click"] is not None:
+                x, y = state["click"]
+                state["click"] = None
+                if y < hsv.shape[0] and x < hsv.shape[1]:
+                    patch = hsv[max(0, y - 5):y + 6, max(0, x - 5):x + 6].reshape(-1, 3)
+                    hue, saturation, value = np.median(patch, axis=0).astype(int)
+                    print(f"Clicked HSV = ({hue}, {saturation}, {value})")
+                    if current == "red" and hue > 90:
+                        hue = 179 - hue
+                    _set_tuner_sliders([
+                        [max(0, hue - 8), max(0, saturation - 60), max(0, value - 70)],
+                        [min(179, hue + 8), 255, 255],
+                    ])
+
+            color_range = _read_tuner_sliders()
+            if current == "red":
+                lower, upper = color_range
+                config["ranges"]["red"] = [
+                    color_range,
+                    [[179 - upper[0], lower[1], lower[2]], [179, upper[1], upper[2]]],
+                ]
+            else:
+                config["ranges"][current] = [color_range]
+
+            mask = detector.mask(hsv, current)
+            detection = detector.detect(frame)[current]
+            view = frame.copy()
+            if detection is not None:
+                x, y, w, h = detection.bbox
+                cv2.rectangle(view, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            status = (
+                f"Editing {current.upper()}  1/2/3 switch  S save  "
+                f"WB={'on' if config['white_balance'] else 'off'}"
+            )
+            cv2.putText(view, status, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (0, 255, 255), 2)
+            cv2.imshow(TUNER_WINDOW, cv2.hconcat([view, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)]))
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            if key in (ord("1"), ord("2"), ord("3")):
+                current = COLORS[key - ord("1")]
+                _set_tuner_sliders(config["ranges"][current][0])
+            elif key == ord("w"):
+                config["white_balance"] = not config["white_balance"]
+            elif key == ord("s"):
+                save_config(config)
+                print("Saved", CONFIG_PATH)
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+def run_mission(args):
 
     while True:
         try:
@@ -387,6 +667,36 @@ def main():
             writer.release()
         cv2.destroyAllWindows()
         print("Results:", ctrl.results)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Mission 5 camera test, colour tuning, and pole-hitting controller"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("camera", "tune", "mission"),
+        default="mission",
+        help="camera = raw feed, tune = HSV tuner, mission = controller (default)",
+    )
+    parser.add_argument("--camera", default="0", help="camera index or video path (default 0)")
+    parser.add_argument("--order", help="referee order, e.g. R-B-Y (asked for if omitted)")
+    parser.add_argument("--auto-confirm", action="store_true",
+                        help="assume the ball dropped after each hit")
+    parser.add_argument("--record", help="save raw mission camera video to this .mp4")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="mission without a window; starts immediately")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.mode == "camera":
+        run_camera_test(args.camera)
+    elif args.mode == "tune":
+        run_hsv_tuner(args.camera)
+    else:
+        run_mission(args)
 
 
 if __name__ == "__main__":

@@ -15,8 +15,15 @@ import unittest
 import cv2
 import numpy as np
 
-from mission5 import Command, ControlParams, MissionController, parse_order
-from pole_detector import DEFAULT_CONFIG, Detection, PoleDetector
+from mission5 import (
+    DEFAULT_CONFIG,
+    Command,
+    ControlParams,
+    Detection,
+    MissionController,
+    PoleDetector,
+    parse_order,
+)
 
 W, H = 640, 480
 # How poles might look through murky blue-green water (BGR)
