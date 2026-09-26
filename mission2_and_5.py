@@ -9,10 +9,13 @@ Examples:
     python mission2_and_5.py mission5 --order R-B-Y --camera 0
 
 Run without a command to open the combined Mission 2/5 topside controller.
-"""
 
-"""
-mission2_and_5.py - topside control program for the CityUHK UR Fall Training 2026 ROV.
+Code map (search for these headings in this file):
+    SHARED   - camera, serial, thruster mixing, window, and input handling
+    MISSION 2 - AprilTag detection, capture gallery, and largest/smallest target
+    MISSION 5 - coloured-pole detection and autonomous state machine
+
+This is the topside control program for the CityUHK UR Fall Training 2026 ROV.
 
 One window with:
   * live camera feed with AprilTag and colour-detection overlays
@@ -77,7 +80,7 @@ except ImportError:
 
 
 # =============================================================================
-# CONFIGURATION - edit this section to match your ROV
+# SHARED CONFIGURATION - edit this section to match your ROV
 # =============================================================================
 
 # Thruster layout. Each thruster lists how much it pushes for each motion:
@@ -118,11 +121,15 @@ BAUD = 115200
 SEND_HZ = 30
 
 CAMERA_WIDTH, CAMERA_HEIGHT = 640, 480
+
+# MISSION 2 CONFIGURATION: AprilTag confirmation and saved photographs.
 TAG_CONFIRM_FRAMES = 3      # a tag must be seen in this many frames before it counts
 TAG_BETTER_FACTOR = 1.15    # replace a tag's photo when it appears 15% bigger (closer, clearer)
 CAPTURE_ROOT = Path("captures")
 
-# Colour detection for Mission 5, in OpenCV HSV (hue 0-180). Pool lighting and
+# MISSION 5 CONFIGURATION: simple preview detection in OpenCV HSV (hue 0-180).
+# The full autonomous detector configuration is in the Mission 5 section below.
+# Pool lighting and
 # water shift colours, so tune these with pool footage. A blue pool floor can
 # trigger "B"; raise the blue saturation minimum if that happens.
 COLOUR_RANGES = {
@@ -198,7 +205,7 @@ HELP_RIGHT = [
 
 
 # =============================================================================
-# Small helpers
+# SHARED HELPERS
 # =============================================================================
 
 def clamp(value, low=-1.0, high=1.0):
@@ -286,7 +293,7 @@ def generate_marker(dictionary, tag_id, size):
 
 
 # =============================================================================
-# Vision
+# MISSION 2 - APRILTAG DETECTION AND CAPTURE
 # =============================================================================
 
 class TagDetector:
@@ -396,6 +403,12 @@ class TagTracker:
             cv2.imwrite(str(self.capture_dir / "highest.jpg"), self.best[self.highest()]["image"])
 
 
+# =============================================================================
+# MISSION 5 - SIMPLE COLOUR PREVIEW
+# Used when colour detection is enabled before an autonomous order is loaded.
+# The full autonomous PoleDetector is in the dedicated Mission 5 section below.
+# =============================================================================
+
 def detect_colours(frame):
     """Returns a list of (colour letter, (x, y, w, h), area) for red/yellow/blue blobs."""
     hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV)
@@ -437,7 +450,7 @@ def draw_colour_overlays(image, found):
 
 
 # =============================================================================
-# Video sources
+# SHARED CAMERA SOURCES
 # =============================================================================
 
 class CameraSource:
@@ -557,7 +570,7 @@ class DemoSource:
 
 
 # =============================================================================
-# Serial link to the ESP32
+# SHARED SERIAL LINK TO THE ROV CONTROLLER
 # =============================================================================
 
 class SerialLink:
@@ -706,7 +719,7 @@ class SerialLink:
 
 
 # =============================================================================
-# Text entry box (pole order and camera source)
+# SHARED TEXT-ENTRY PROMPT
 # =============================================================================
 
 class Prompt:
@@ -752,7 +765,11 @@ class Prompt:
 
 
 # =============================================================================
-# Main application
+# SHARED INTERFACE - CONNECTS MISSION 2 AND MISSION 5
+#
+# Mission-specific work is kept in explicitly named methods:
+#   process_mission2_frame / draw_mission2_panel
+#   process_mission5_frame / draw_mission5_panel
 # =============================================================================
 
 class App:
@@ -778,14 +795,16 @@ class App:
         self.armed = False
         self.hook_open = False
         self.speed_index = DEFAULT_SPEED_INDEX
+
+        # Mission 2 state (AprilTags and capture gallery).
         self.mode = args.mode
         self.family = args.family
         self.tags_on = True
-        self.colours_on = False
         self.gallery = False
-        self.show_help = False
-        self.prompt = None
-        self.reset_pressed_at = 0.0
+        self.in_view = []
+
+        # Mission 5 state (coloured poles and autonomous controller).
+        self.colours_on = False
         self.pole_order = ""
         self.mission_detector = PoleDetector(load_config())
         self.mission_controller = None
@@ -794,11 +813,15 @@ class App:
         self.mission_detections = {}
         self.mission_last_frame_at = None
         self.mission_complete_logged = False
+        self.colours_in_view = []
+
+        # Shared interface, drive, and camera state.
+        self.show_help = False
+        self.prompt = None
+        self.reset_pressed_at = 0.0
         self.joystick = None
         self.cmd = {axis: 0.0 for axis in AXES_ORDER}
         self.thrust = [0] * len(THRUSTERS)
-        self.in_view = []
-        self.colours_in_view = []
         self.frame_surface = None
         self.last_display = None
         self.last_frame_id = -1
@@ -902,8 +925,9 @@ class App:
             elif line:
                 self.log("ROV: " + line)
 
-    # ---------------------------------------------------------------- camera
+    # ---------------------------------------------------------- shared camera
     def update_camera(self):
+        """Read one frame, then let Mission 2 and Mission 5 process it separately."""
         frame_id = self.camera.frame_id
         if frame_id == self.last_frame_id:
             return
@@ -912,6 +936,17 @@ class App:
             return
         self.last_frame_id = frame_id
         display = frame.copy()
+
+        self.process_mission2_frame(frame, display)
+        self.process_mission5_frame(frame, display)
+
+        self.last_display = display
+        size = fit_size(display.shape[1], display.shape[0], VIEW.width, VIEW.height)
+        self.frame_surface = cv_to_surface(display, size)
+
+    # --------------------------------------------------------------- Mission 2
+    def process_mission2_frame(self, frame, display):
+        """Detect AprilTags, update saved captures, and draw Mission 2 overlays."""
         if self.tags_on:
             detections = self.detector.detect(frame)
             self.in_view = sorted({d[0] for d in detections})
@@ -920,6 +955,10 @@ class App:
             draw_tag_overlays(display, detections, self.tracker.target(self.mode))
         else:
             self.in_view = []
+
+    # --------------------------------------------------------------- Mission 5
+    def process_mission5_frame(self, frame, display):
+        """Run pole detection and, when enabled, advance Mission 5 autonomy."""
         if self.mission_controller is not None:
             now = time.monotonic()
             self.mission_last_frame_at = now
@@ -963,9 +1002,6 @@ class App:
             draw_colour_overlays(display, found)
         else:
             self.colours_in_view = []
-        self.last_display = display
-        size = fit_size(display.shape[1], display.shape[0], VIEW.width, VIEW.height)
-        self.frame_surface = cv_to_surface(display, size)
 
     def save_photo(self):
         if self.last_display is None:
@@ -1034,45 +1070,27 @@ class App:
             self.toggle_hook()
         elif k in speed_keys:
             self.set_speed(speed_keys[k])
-        elif k == pygame.K_g:
-            self.gallery = not self.gallery
-        elif k == pygame.K_m:
-            self.mode = "smallest" if self.mode == "largest" else "largest"
-            self.log(f"Mission 2.1 mode: {self.mode}")
-        elif k == pygame.K_t:
-            self.tags_on = not self.tags_on
-            self.log(f"AprilTag detection {'on' if self.tags_on else 'off'}")
-        elif k == pygame.K_c:
-            if self.mission_controller is not None:
-                self.log("Mission 5 pole detection stays on while an order is loaded")
-            else:
-                self.colours_on = not self.colours_on
-                self.log(f"Colour detection {'on' if self.colours_on else 'off'}")
         elif k == pygame.K_p:
             self.save_photo()
-        elif k == pygame.K_F3:
-            self.prompt = Prompt("Mission 5 pole order",
-                                 [("Order from the referee, e.g. R-B-Y", self.pole_order, validate_order)],
-                                 self.apply_order)
-        elif k == pygame.K_F6:
-            self.toggle_mission5()
-        elif k == pygame.K_y and self.mission_controller is not None:
-            self.mission_controller.confirm(True, time.monotonic())
-            self.log("Mission 5: ball drop confirmed")
-        elif k == pygame.K_n and self.mission_controller is not None:
-            self.mission_controller.confirm(False, time.monotonic())
-            self.log("Mission 5: retrying current pole")
-        elif k == pygame.K_k and self.mission_controller is not None:
-            self.mission_controller.skip(time.monotonic())
-            self.log("Mission 5: skipped current pole")
-        elif k == pygame.K_F7 and self.mission_controller is not None:
-            self.pause_mission5("mission restarted")
-            self.mission_controller.reset()
-            self.mission_complete_logged = False
-            self.log("Mission 5 restarted")
         elif k == pygame.K_F8:
             self.open_camera_prompt()
-        elif k == pygame.K_F5:
+        else:
+            handled_by_mission2 = self.handle_mission2_key(k)
+            if not handled_by_mission2:
+                self.handle_mission5_key(k)
+
+    # --------------------------------------------------------------- Mission 2
+    def handle_mission2_key(self, key):
+        """Handle only Mission 2 controls. Return True when the key was used."""
+        if key == pygame.K_g:
+            self.gallery = not self.gallery
+        elif key == pygame.K_m:
+            self.mode = "smallest" if self.mode == "largest" else "largest"
+            self.log(f"Mission 2.1 mode: {self.mode}")
+        elif key == pygame.K_t:
+            self.tags_on = not self.tags_on
+            self.log(f"AprilTag detection {'on' if self.tags_on else 'off'}")
+        elif key == pygame.K_F5:
             now = time.time()
             if now - self.reset_pressed_at < 2.0:
                 self.tracker.reset()
@@ -1081,6 +1099,46 @@ class App:
             else:
                 self.reset_pressed_at = now
                 self.log("Press F5 again within 2 s to clear captured tags")
+        else:
+            return False
+        return True
+
+    # --------------------------------------------------------------- Mission 5
+    def handle_mission5_key(self, key):
+        """Handle only Mission 5 controls. Return True when the key was used."""
+        if key == pygame.K_c:
+            if self.mission_controller is not None:
+                self.log("Mission 5 pole detection stays on while an order is loaded")
+            else:
+                self.colours_on = not self.colours_on
+                self.log(f"Colour detection {'on' if self.colours_on else 'off'}")
+        elif key == pygame.K_F3:
+            self.prompt = Prompt("Mission 5 pole order",
+                                 [("Order from the referee, e.g. R-B-Y", self.pole_order, validate_order)],
+                                 self.apply_order)
+        elif key == pygame.K_F6:
+            self.toggle_mission5()
+        elif key == pygame.K_y:
+            if self.mission_controller is not None:
+                self.mission_controller.confirm(True, time.monotonic())
+                self.log("Mission 5: ball drop confirmed")
+        elif key == pygame.K_n:
+            if self.mission_controller is not None:
+                self.mission_controller.confirm(False, time.monotonic())
+                self.log("Mission 5: retrying current pole")
+        elif key == pygame.K_k:
+            if self.mission_controller is not None:
+                self.mission_controller.skip(time.monotonic())
+                self.log("Mission 5: skipped current pole")
+        elif key == pygame.K_F7:
+            if self.mission_controller is not None:
+                self.pause_mission5("mission restarted")
+                self.mission_controller.reset()
+                self.mission_complete_logged = False
+                self.log("Mission 5 restarted")
+        else:
+            return False
+        return True
 
     def read_commands(self):
         cmd = {axis: 0.0 for axis in AXES_ORDER}
@@ -1394,26 +1452,43 @@ class App:
             self.text(f"{value:+4d}", bar_x + bar_w + 8, y)
             y += 19
 
-        y = self.section(x, y + 6, w, "AprilTags (Mission 2.1)")
+        y = self.draw_mission2_panel(x, y, w)
+        y = self.draw_mission5_panel(x, y, w)
+
+        y = self.section(x, y + 6, w, "Log")
+        rows = max(0, (p.bottom - 8 - y) // 17)
+        if rows:
+            for line in list(self.log_lines)[-rows:]:
+                self.text(line, x, y, MUTED, self.font_small, max_width=w)
+                y += 17
+
+    # --------------------------------------------------------------- Mission 2
+    def draw_mission2_panel(self, x, y, width):
+        """Draw only Mission 2's AprilTag status block."""
+        y = self.section(x, y + 6, width, "AprilTags (Mission 2.1)")
         target = self.tracker.target(self.mode)
         self.text(f"Mode {self.mode}   {self.family}   detect {'on' if self.tags_on else 'OFF'}",
-                  x, y, max_width=w)
+                  x, y, max_width=width)
         y += 19
-        self.text(f"In view:  {fmt_ids(self.in_view)}", x, y, max_width=w)
+        self.text(f"In view:  {fmt_ids(self.in_view)}", x, y, max_width=width)
         y += 19
-        self.text(f"Captured: {fmt_ids(self.tracker.ids)}", x, y, max_width=w)
+        self.text(f"Captured: {fmt_ids(self.tracker.ids)}", x, y, max_width=width)
         y += 19
         self.text(f"Target:   {target if target is not None else '-'}", x, y,
                   GOOD if target is not None else MUTED, self.font_bold)
         y += 19
+        return y
 
-        y = self.section(x, y + 6, w, "Poles (Mission 5)")
-        self.text(f"Order: {self.pole_order or '- (press F3)'}", x, y, max_width=w)
+    # --------------------------------------------------------------- Mission 5
+    def draw_mission5_panel(self, x, y, width):
+        """Draw only Mission 5's coloured-pole and autonomy status block."""
+        y = self.section(x, y + 6, width, "Poles (Mission 5)")
+        self.text(f"Order: {self.pole_order or '- (press F3)'}", x, y, max_width=width)
         y += 19
         colours = " ".join(COLOUR_NAMES[c] for c in self.colours_in_view) or "-"
         if not self.colours_on and self.mission_controller is None:
             colours = "detection off (C)"
-        self.text(f"Colours in view: {colours}", x, y, max_width=w)
+        self.text(f"Colours in view: {colours}", x, y, max_width=width)
         y += 19
         if self.mission_controller is not None:
             target = self.mission_controller.target
@@ -1425,23 +1500,17 @@ class App:
                 x,
                 y,
                 GOOD if self.mission_running else MUTED,
-                max_width=w,
+                max_width=width,
             )
             y += 19
             self.text(
                 f"Pole width {width_text}  F6 start/pause  Y/N confirm",
                 x,
                 y,
-                max_width=w,
+                max_width=width,
             )
             y += 19
-
-        y = self.section(x, y + 6, w, "Log")
-        rows = max(0, (p.bottom - 8 - y) // 17)
-        if rows:
-            for line in list(self.log_lines)[-rows:]:
-                self.text(line, x, y, MUTED, self.font_small, max_width=w)
-                y += 17
+        return y
 
     def draw_bottom_bar(self):
         y = WIN_H - 24
@@ -1502,6 +1571,8 @@ class App:
 
 
 # =============================================================================
+# SHARED INTERFACE STARTUP
+# =============================================================================
 
 def parse_control_args(argv=None):
     parser = argparse.ArgumentParser(description="ROV topside control program")
@@ -1538,7 +1609,10 @@ def run_control_interface(argv=None):
         app.shutdown()
 
 # =============================================================================
-# Mission 5 autonomy, detection, and tuning
+# MISSION 5 - AUTONOMOUS COLOURED-POLE SYSTEM
+#
+# This section contains the complete Mission 5 implementation:
+#   configuration -> detection -> state machine -> standalone runtime tools
 # =============================================================================
 
 """Mission 5: find the coloured poles and hit them in the referee's order.
@@ -1740,6 +1814,10 @@ def draw_detections(frame, detections, target=None):
 LETTER_TO_COLOR = {"R": "red", "Y": "yellow", "B": "blue"}
 
 
+# ---------------------------------------------------------------------------
+# Mission 5 order, commands, and state machine
+# ---------------------------------------------------------------------------
+
 def parse_order(text):
     """'R-B-Y' -> ['red', 'blue', 'yellow']. Also accepts 'rby', 'R B Y', 'R,B,Y'."""
     letters = [ch for ch in text.upper() if ch.isalpha()]
@@ -1772,10 +1850,6 @@ def mission_command_to_axes(command):
         "heave": clamp(-command.heave),
         "yaw": clamp(command.yaw),
     }
-
-
-def clamp(v, lo=-1.0, hi=1.0):
-    return max(lo, min(hi, v))
 
 
 @dataclass
@@ -1931,6 +2005,10 @@ class MissionController:
         surge = p.approach_surge + (p.min_surge - p.approach_surge) * closeness
         return Command(surge=surge, yaw=yaw, heave=heave)
 
+
+# ---------------------------------------------------------------------------
+# Mission 5 standalone OpenCV runtime
+# ---------------------------------------------------------------------------
 
 class ConsoleRov:
     """Stand-in for the real thruster link: prints commands when they change.
