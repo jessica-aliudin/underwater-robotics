@@ -15,6 +15,13 @@ Code map (search for these headings in this file):
     MISSION 2 - AprilTag detection, capture gallery, and largest/smallest target
     MISSION 5 - coloured-pole detection and autonomous state machine
 
+How the pieces fit together:
+    1. CameraSource supplies the newest camera frame without freezing the UI.
+    2. App sends that frame to the Mission 2 and Mission 5 processors.
+    3. Mission 2 records AprilTags; Mission 5 can produce an autonomous Command.
+    4. The shared mixer converts manual/autonomous movement into thruster values.
+    5. SerialLink sends those values to the ROV. Disarming always sends zeros.
+
 This is the topside control program for the CityUHK UR Fall Training 2026 ROV.
 
 One window with:
@@ -209,6 +216,7 @@ HELP_RIGHT = [
 # =============================================================================
 
 def clamp(value, low=-1.0, high=1.0):
+    """Keep a number inside a safe range; motor commands normally use -1 to +1."""
     return max(low, min(high, value))
 
 
@@ -256,10 +264,12 @@ def cv_to_surface(image, size):
 
 
 def fmt_ids(ids):
+    """Make a short ID list for the panel, using '-' when nothing is available."""
     return ", ".join(str(i) for i in ids) if ids else "-"
 
 
 def validate_order(text):
+    """Return a friendly prompt error unless the entry is R/Y/B exactly once."""
     parts = [p.strip().upper() for p in text.split("-")]
     if sorted(parts) != ["B", "R", "Y"]:
         return "Use R, Y and B once each, joined by hyphens, e.g. R-B-Y"
@@ -267,6 +277,7 @@ def validate_order(text):
 
 
 def validate_camera_source(text):
+    """The prompt accepts camera numbers, video paths, or the built-in demo."""
     return None if text.strip() else "Enter a camera index, video path, or demo"
 
 
@@ -281,12 +292,14 @@ def parse_camera_source(text):
 
 
 def aruco_dictionary(family):
+    """Translate the readable family name into OpenCV's AprilTag dictionary."""
     if not hasattr(cv2, "aruco"):
         sys.exit("This OpenCV has no AprilTag support. Run: pip install --upgrade opencv-python")
     return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, TAG_FAMILIES[family]))
 
 
 def generate_marker(dictionary, tag_id, size):
+    """Create a demo AprilTag while supporting both old and new OpenCV APIs."""
     if hasattr(cv2.aruco, "generateImageMarker"):
         return cv2.aruco.generateImageMarker(dictionary, tag_id, size)
     return cv2.aruco.drawMarker(dictionary, tag_id, size)
@@ -333,6 +346,7 @@ class TagTracker:
         self.reset()
 
     def reset(self):
+        """Forget the current run and prepare a new timestamped capture folder."""
         self.capture_dir = self.root / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.hits = {}        # tag id -> number of frames it has been seen in
         self.best = {}        # tag id -> {"image", "area", "time"}
@@ -342,15 +356,19 @@ class TagTracker:
 
     @property
     def ids(self):
+        """Every confirmed tag ID, sorted so the gallery stays predictable."""
         return sorted(self.best)
 
     def lowest(self):
+        """The smallest confirmed ID, or None before any tag has been captured."""
         return min(self.best) if self.best else None
 
     def highest(self):
+        """The largest confirmed ID, or None before any tag has been captured."""
         return max(self.best) if self.best else None
 
     def target(self, mode):
+        """Mission 2 target: choose the highest or lowest tag requested by the referee."""
         return self.highest() if mode == "largest" else self.lowest()
 
     def update(self, detections, frame):
@@ -429,6 +447,7 @@ def detect_colours(frame):
 
 
 def draw_tag_overlays(image, detections, target_id):
+    """Draw visible tag boxes; the selected Mission 2 target gets a thicker label."""
     for tag_id, pts, _ in detections:
         corners = pts.astype(np.int32)
         is_target = tag_id == target_id
@@ -442,6 +461,7 @@ def draw_tag_overlays(image, detections, target_id):
 
 
 def draw_colour_overlays(image, found):
+    """Draw the lightweight colour-preview boxes used before Mission 5 is started."""
     for name, (x, y, w, h), _ in found:
         colour = COLOUR_BGR[name]
         cv2.rectangle(image, (x, y), (x + w, y + h), colour, 2)
@@ -566,6 +586,7 @@ class DemoSource:
         return cv2.add(frame, np.random.randint(0, 12, frame.shape, np.uint8))
 
     def stop(self):
+        # Kept for the same interface as CameraSource; the demo owns no hardware.
         pass
 
 
@@ -599,6 +620,7 @@ class SerialLink:
 
     @property
     def ready(self):
+        """Dry-run counts as ready so the interface can be practised without hardware."""
         return self.dry_run or self.ser is not None
 
     @property
@@ -610,6 +632,7 @@ class SerialLink:
         return "ROV not connected"
 
     def _find_port(self):
+        """Use the requested COM port, or look for common ESP32 USB adapters."""
         if self.requested_port:
             return self.requested_port
         for p in serial.tools.list_ports.comports():
@@ -668,6 +691,7 @@ class SerialLink:
             self.on_lost()
 
     def send(self, line):
+        """Send one newline-terminated command; False means there is no usable link."""
         if self.dry_run:
             return True
         error = None
@@ -700,6 +724,7 @@ class SerialLink:
                 self._incoming.put(raw.decode("utf-8", errors="replace").strip())
 
     def poll(self):
+        """Return every complete line received since the last UI frame."""
         lines = []
         while True:
             try:
@@ -708,6 +733,7 @@ class SerialLink:
                 return lines
 
     def close(self):
+        """Stop the reader loop and release the serial port during shutdown."""
         self._running = False
         with self._lock:
             s, self.ser = self.ser, None
@@ -723,6 +749,8 @@ class SerialLink:
 # =============================================================================
 
 class Prompt:
+    """Small in-app form used for values such as pole order and camera number."""
+
     def __init__(self, title, fields, on_done):
         """fields: list of (label, default text, validator or None)."""
         self.title = title
@@ -770,9 +798,13 @@ class Prompt:
 # Mission-specific work is kept in explicitly named methods:
 #   process_mission2_frame / draw_mission2_panel
 #   process_mission5_frame / draw_mission5_panel
+# Mission 5's classes are defined later in the file. That is safe because
+# Python finishes loading the file before main() creates this App.
 # =============================================================================
 
 class App:
+    """The main Pygame window and the meeting point for shared, Mission 2, and Mission 5 code."""
+
     def __init__(self, args):
         pygame.display.init()   # only what we need: no audio, so no sound-card errors
         pygame.font.init()
@@ -852,6 +884,7 @@ class App:
             self.step()
 
     def step(self):
+        """Run one UI frame: inputs -> vision -> command choice -> thrusters -> drawing."""
         for event in pygame.event.get():
             self.handle_event(event)
         self.serial.maintain()
@@ -860,6 +893,9 @@ class App:
         manual_cmd = self.read_commands()
         now = time.monotonic()
         if self.mission_running:
+            # Mission 5 may drive only while armed, receiving frames, and not
+            # being overridden by the operator. Any of these conditions wins
+            # over autonomy because stopping safely matters more than progress.
             if not self.armed:
                 self.pause_mission5("ROV disarmed")
             elif self.mission_last_frame_at is None or now - self.mission_last_frame_at > 1.0:
@@ -880,6 +916,7 @@ class App:
         self.clock.tick(60)
 
     def shutdown(self):
+        """Stop the motors first, then close serial, camera, saved photos, and Pygame."""
         if self._closed:
             return
         self._closed = True
@@ -902,6 +939,7 @@ class App:
             self.log("Not sent: ROV not connected")
 
     def send_command(self):
+        """Send the current arm/hook/thruster state at a fixed rate."""
         now = time.time()
         if now < self.next_send:
             return
@@ -919,6 +957,7 @@ class App:
         self.disarm("serial connection lost")
 
     def handle_serial_lines(self):
+        """Move messages from the background serial reader into the on-screen log."""
         for line in self.serial.poll():
             if line.startswith("LOG\t"):
                 self.log("ROV: " + line[4:])
@@ -1575,6 +1614,7 @@ class App:
 # =============================================================================
 
 def parse_control_args(argv=None):
+    """Read options for the combined Pygame control interface."""
     parser = argparse.ArgumentParser(description="ROV topside control program")
     parser.add_argument("--camera", default="0",
                         help="camera number (0, 1, ...), a video file path, or 'demo' for a fake scene")
@@ -1592,6 +1632,7 @@ def parse_control_args(argv=None):
 
 
 def run_control_interface(argv=None):
+    """Start the shared interface and guarantee a safe shutdown if it exits."""
     args = parse_control_args(argv)
     if args.list_ports:
         if serial is None:
@@ -1618,9 +1659,9 @@ def run_control_interface(argv=None):
 """Mission 5: find the coloured poles and hit them in the referee's order.
 
 Run one of the three modes:
-    python mission5.py --mode camera --camera 0
-    python mission5.py --mode tune --camera 0
-    python mission5.py --mode mission --order R-B-Y --camera 0
+    python mission2_and_5.py camera --camera 0
+    python mission2_and_5.py tune --camera 0
+    python mission2_and_5.py mission5 --order R-B-Y --camera 0
 
 All Mission 5 runtime tools are intentionally kept in this one file.
 
@@ -1662,8 +1703,9 @@ import numpy as np
 COLORS = ("red", "yellow", "blue")
 DRAW_BGR = {"red": (0, 0, 255), "yellow": (0, 220, 255), "blue": (255, 80, 0)}
 
-# OpenCV HSV uses H 0-179 and S/V 0-255. Red wraps around hue zero, so it
-# needs two ranges.
+# These are the starting values for pool testing. If colors.json exists beside
+# this file, its values override these defaults. OpenCV HSV uses H 0-179 and
+# S/V 0-255. Red wraps around hue zero, which is why it needs two ranges.
 DEFAULT_CONFIG = {
     "white_balance": True,
     "blur_ksize": 5,
@@ -1682,6 +1724,12 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "colors.j
 
 @dataclass
 class Detection:
+    """What the detector knows about one pole in the current camera frame.
+
+    err_x/err_y tell the controller which way to steer. width_frac tells it
+    roughly how close the ROV is to the pole without needing a depth sensor.
+    """
+
     color: str
     bbox: tuple
     center: tuple
@@ -1695,6 +1743,7 @@ class Detection:
 
 
 def load_config(path=CONFIG_PATH):
+    """Load optional pool-tuned values while keeping defaults for missing keys."""
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if path and os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -1706,11 +1755,13 @@ def load_config(path=CONFIG_PATH):
 
 
 def save_config(cfg, path=CONFIG_PATH):
+    """Save HSV tuner values so the main interface can reuse them next time."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
 
 def white_balance_gains(bgr):
+    """Estimate per-channel gains that reduce the pool's blue/green color cast."""
     sample = bgr[::4, ::4].reshape(-1, 3)
     med = np.median(sample, axis=0).astype(np.float32)
     gain = med.mean() / np.maximum(med, 1.0)
@@ -1718,6 +1769,7 @@ def white_balance_gains(bgr):
 
 
 def gray_world_white_balance(bgr, gain=None):
+    """Apply white-balance gains to a frame before looking for pole colors."""
     if gain is None:
         gain = white_balance_gains(bgr)
     lut = np.clip(np.arange(256, dtype=np.float32)[:, None] * gain[None, :], 0, 255)
@@ -1725,6 +1777,8 @@ def gray_world_white_balance(bgr, gain=None):
 
 
 class PoleDetector:
+    """Find the best red, yellow, and blue pole candidate in each frame."""
+
     def __init__(self, config=None):
         self.cfg = config if config is not None else load_config()
         self._wb_gain = None
@@ -1732,6 +1786,7 @@ class PoleDetector:
         self._close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 21))
 
     def preprocess(self, bgr):
+        """Stabilize underwater color and soften camera noise before thresholding."""
         if self.cfg.get("white_balance", True):
             gain = white_balance_gains(bgr)
             self._wb_gain = gain if self._wb_gain is None else 0.9 * self._wb_gain + 0.1 * gain
@@ -1742,6 +1797,7 @@ class PoleDetector:
         return bgr
 
     def mask(self, hsv, color):
+        """Build a black/white image where white pixels match one pole color."""
         mask = None
         for lower, upper in self.cfg["ranges"][color]:
             part = cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8))
@@ -1750,6 +1806,7 @@ class PoleDetector:
         return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._close_k)
 
     def detect(self, bgr, return_masks=False):
+        """Return one best Detection (or None) for every required pole color."""
         height, width = bgr.shape[:2]
         frame_area = float(height * width)
         hsv = cv2.cvtColor(self.preprocess(bgr), cv2.COLOR_BGR2HSV)
@@ -1761,6 +1818,7 @@ class PoleDetector:
         return (results, masks) if return_masks else results
 
     def _best_blob(self, mask, color, width, height, frame_area):
+        """Reject tiny/wide noise and keep the blob that looks most like a pole."""
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         best = None
         for contour in contours:
@@ -1793,6 +1851,7 @@ class PoleDetector:
 
 
 def draw_detections(frame, detections, target=None):
+    """Show pole boxes and their width; the current target is drawn thicker."""
     for color, detection in detections.items():
         if detection is None:
             continue
@@ -1827,6 +1886,7 @@ def parse_order(text):
 
 
 def order_str(order):
+    """Turn ['red', 'blue', 'yellow'] back into the referee format R-B-Y."""
     return "-".join(c[0].upper() for c in order)
 
 
@@ -1854,6 +1914,8 @@ def mission_command_to_axes(command):
 
 @dataclass
 class ControlParams:
+    """Mission 5 movement settings. Values marked TUNE should be tested in the pool."""
+
     search_yaw: float = 0.25      # yaw speed while looking for the pole
     search_turn_time: float = 30.0  # TUNE: ~time for one full 360 spin at search_yaw
     reposition_surge: float = 0.4   # nothing found after a full spin -> move and retry
@@ -1877,6 +1939,12 @@ class ControlParams:
 
 
 class MissionController:
+    """Mission 5 decision maker.
+
+    It never talks to motors directly. update() only returns a safe, normalized
+    Command; the shared interface handles arming, speed limits, and serial output.
+    """
+
     SEARCH, REPOSITION, ALIGN, APPROACH, HIT, BACK_OFF, CONFIRM, DONE = (
         "SEARCH", "REPOSITION", "ALIGN", "APPROACH", "HIT", "BACK_OFF", "CONFIRM", "DONE")
 
@@ -1887,6 +1955,7 @@ class MissionController:
         self.reset()
 
     def reset(self):
+        """Go back to the first pole and clear results from the previous attempt."""
         self.index = 0
         self.results = {}           # color -> "hit" | "skipped"
         self._enter(self.SEARCH, None)  # timer starts on the first update()
@@ -1896,13 +1965,16 @@ class MissionController:
 
     @property
     def target(self):
+        """The pole color currently being attempted, or None when all are done."""
         return self.order[self.index] if self.index < len(self.order) else None
 
     def _enter(self, state, now):
+        """Change state and remember when it began for timed actions."""
         self.state = state
         self.state_since = now
 
     def _next_target(self, now, result):
+        """Record hit/skipped for this pole and advance to the next color."""
         self.results[self.target] = result
         self.index += 1
         self._seen_count = 0
@@ -1926,11 +1998,13 @@ class MissionController:
         self._last_seen = None
 
     def skip(self, now):
+        """Mark the current pole skipped so a run can continue after a problem."""
         if self.target is not None:
             self._next_target(now, "skipped")
 
     # main step --------------------------------------------------------------
     def update(self, detections, now):
+        """Advance the state machine once and return the movement wanted now."""
         p = self.p
         det = detections.get(self.target) if self.target else None
         if det is not None:
@@ -1946,6 +2020,8 @@ class MissionController:
         if self.state == self.DONE:
             return Command()
 
+        # HIT and BACK_OFF are timed because the pole may disappear from view
+        # once it is close enough to touch the front of the ROV.
         if self.state == self.HIT:
             if elapsed >= p.hit_time:
                 self._enter(self.BACK_OFF, now)
@@ -1963,6 +2039,8 @@ class MissionController:
         if self.state == self.CONFIRM:
             return Command()
 
+        # SEARCH turns in place. After a full turn, REPOSITION moves to a new
+        # patch of water so we do not keep searching from the same blind spot.
         if self.state in (self.SEARCH, self.REPOSITION):
             if det is not None and self._seen_count >= p.confirm_frames:
                 self._enter(self.ALIGN, now)
@@ -1977,7 +2055,8 @@ class MissionController:
                     return Command()
                 return Command(surge=p.reposition_surge)
 
-        # ALIGN / APPROACH need the pole in view
+        # ALIGN / APPROACH need the pole in view. A very short dropout is
+        # ignored, but a longer loss sends us back to SEARCH.
         if det is None:
             if self._last_seen is None or now - self._last_seen > p.lost_timeout:
                 self._enter(self.SEARCH, now)
@@ -1993,7 +2072,8 @@ class MissionController:
             else:
                 return Command(yaw=yaw, heave=heave)
 
-        # APPROACH
+        # APPROACH keeps steering while moving forward. Pole width is used as
+        # the distance cue: a wider pole means it is closer to the camera.
         if det.width_frac >= p.hit_width_frac:
             self._enter(self.HIT, now)
             return Command(surge=p.hit_surge)
@@ -2034,6 +2114,7 @@ class ConsoleRov:
 
 
 def draw_hud(frame, ctrl, cmd, running, fps):
+    """Add status and alignment guides to the standalone Mission 5 window."""
     H, W = frame.shape[:2]
     p = ctrl.p
     # centre line and align tolerance band
@@ -2105,6 +2186,7 @@ def draw_interface_mission_hud(frame, ctrl, cmd, armed, running, fps):
 
 
 def mask_view(masks, size):
+    """Combine the three black/white colour masks into one debugging strip."""
     W, H = size
     tiles = []
     for c in COLORS:
@@ -2116,6 +2198,7 @@ def mask_view(masks, size):
 
 
 def open_source(src):
+    """Open a camera number or video file, preferring the fast Windows backend."""
     source = str(src)
     if source.isdigit():
         cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)  # DSHOW opens fast on Windows
@@ -2154,12 +2237,14 @@ TUNER_SLIDERS = ("H min", "H max", "S min", "S max", "V min", "V max")
 
 
 def _set_tuner_sliders(color_range):
+    """Move the HSV tuner controls to match the selected colour's saved range."""
     (h0, s0, v0), (h1, s1, v1) = color_range
     for name, value in zip(TUNER_SLIDERS, (h0, h1, s0, s1, v0, v1)):
         cv2.setTrackbarPos(name, TUNER_WINDOW, int(value))
 
 
 def _read_tuner_sliders():
+    """Read the six HSV controls and return one lower/upper threshold pair."""
     h0, h1, s0, s1, v0, v1 = (
         cv2.getTrackbarPos(name, TUNER_WINDOW) for name in TUNER_SLIDERS
     )
@@ -2253,6 +2338,7 @@ def run_hsv_tuner(camera):
 
 
 def run_mission(args):
+    """Run Mission 5 in its standalone OpenCV window (without the Pygame UI)."""
 
     while True:
         try:
@@ -2338,6 +2424,7 @@ def run_mission(args):
 
 
 def build_mission5_parser():
+    """Describe command-line options used by camera, tuner, and Mission 5 modes."""
     parser = argparse.ArgumentParser(
         description="Mission 5 camera test, colour tuning, and pole-hitting controller"
     )
@@ -2358,6 +2445,7 @@ def build_mission5_parser():
 
 
 def run_mission5_modes(argv=None):
+    """Send the requested standalone mode to its camera, tuner, or mission runner."""
     args = build_mission5_parser().parse_args(argv)
     if args.mode == "camera":
         run_camera_test(args.camera)
@@ -2372,6 +2460,7 @@ def run_mission5_modes(argv=None):
 
 
 def main(argv=None):
+    """Choose the combined interface or one of the standalone camera tools."""
     arguments = list(sys.argv[1:] if argv is None else argv)
     commands = {"control", "mission2", "mission5", "camera", "tune"}
     command = arguments.pop(0) if arguments and arguments[0] in commands else "control"
