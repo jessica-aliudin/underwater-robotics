@@ -15,7 +15,7 @@ import unittest
 import cv2
 import numpy as np
 
-from mission5 import (
+from all_missions import (
     DEFAULT_CONFIG,
     Command,
     ControlParams,
