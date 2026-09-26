@@ -24,7 +24,8 @@ One window with:
                  and keeps the clearest photo of each tag
   * Gallery (G): photos of the LOWEST and HIGHEST tag IDs side by side, plus
                  thumbnails of every tag captured. Photos are also saved as JPGs.
-  * Mission 5:   enter the pole order (e.g. R-B-Y) and send it to the ROV
+  * Mission 5:   detect, align with, approach, and hit coloured poles in the
+                 referee's order using the same camera and serial thruster link
 
 Install (Python 3.9+):
     pip install pygame opencv-python pyserial numpy
@@ -191,7 +192,10 @@ HELP_RIGHT = [
     ("G", "gallery: lowest/highest tags"),
     ("F5 twice", "clear captured tags"),
     ("F3", "Mission 5: pole order"),
-    ("C", "colour detection on / off"),
+    ("F6", "Mission 5 autonomy start / pause"),
+    ("Y / N", "ball dropped / retry"),
+    ("K / F7", "skip target / restart mission"),
+    ("C", "simple colour detection on / off"),
     ("Other", None),
     ("P", "save a photo of the camera view"),
     ("F1 / Esc", "close this help"),
@@ -781,6 +785,13 @@ class App:
         self.reset_pressed_at = 0.0
         self.wifi = None
         self.pole_order = ""
+        self.mission_detector = PoleDetector(load_config())
+        self.mission_controller = None
+        self.mission_running = False
+        self.mission_command = Command()
+        self.mission_detections = {}
+        self.mission_last_frame_at = None
+        self.mission_complete_logged = False
         self.wifi_message = ""
         self.joystick = None
         self.cmd = {axis: 0.0 for axis in AXES_ORDER}
@@ -825,7 +836,20 @@ class App:
         self.serial.maintain()
         self.handle_serial_lines()
         self.update_camera()
-        self.cmd = self.read_commands()
+        manual_cmd = self.read_commands()
+        now = time.monotonic()
+        if self.mission_running:
+            if not self.armed:
+                self.pause_mission5("ROV disarmed")
+            elif self.mission_last_frame_at is None or now - self.mission_last_frame_at > 1.0:
+                self.disarm("Mission 5 camera feed lost")
+            elif any(abs(value) > 0.01 for value in manual_cmd.values()):
+                self.pause_mission5("manual override")
+                self.cmd = manual_cmd
+            else:
+                self.cmd = mission_command_to_axes(self.mission_command)
+        else:
+            self.cmd = manual_cmd
         speed = SPEED_STEPS[self.speed_index]
         self.thrust = mix(self.cmd, speed) if self.armed else [0] * len(THRUSTERS)
         self.send_command()
@@ -903,7 +927,44 @@ class App:
             draw_tag_overlays(display, detections, self.tracker.target(self.mode))
         else:
             self.in_view = []
-        if self.colours_on:
+        if self.mission_controller is not None:
+            now = time.monotonic()
+            self.mission_last_frame_at = now
+            self.mission_detections = self.mission_detector.detect(frame)
+            self.colours_in_view = [
+                color[0].upper()
+                for color in COLORS
+                if self.mission_detections.get(color) is not None
+            ]
+            if self.mission_running and self.armed:
+                self.mission_command = self.mission_controller.update(
+                    self.mission_detections, now
+                )
+            else:
+                self.mission_command = Command()
+            draw_detections(
+                display,
+                self.mission_detections,
+                self.mission_controller.target,
+            )
+            draw_interface_mission_hud(
+                display,
+                self.mission_controller,
+                self.mission_command,
+                self.armed,
+                self.mission_running,
+                self.camera.fps,
+            )
+            if (
+                self.mission_controller.state == self.mission_controller.DONE
+                and not self.mission_complete_logged
+            ):
+                self.mission_complete_logged = True
+                self.mission_running = False
+                self.mission_command = Command()
+                self.log(f"Mission 5 complete: {self.mission_controller.results}")
+                self.disarm("Mission 5 complete")
+        elif self.colours_on:
             found = detect_colours(frame)
             self.colours_in_view = sorted({f[0] for f in found}, key="RYB".index)
             draw_colour_overlays(display, found)
@@ -989,8 +1050,11 @@ class App:
             self.tags_on = not self.tags_on
             self.log(f"AprilTag detection {'on' if self.tags_on else 'off'}")
         elif k == pygame.K_c:
-            self.colours_on = not self.colours_on
-            self.log(f"Colour detection {'on' if self.colours_on else 'off'}")
+            if self.mission_controller is not None:
+                self.log("Mission 5 pole detection stays on while an order is loaded")
+            else:
+                self.colours_on = not self.colours_on
+                self.log(f"Colour detection {'on' if self.colours_on else 'off'}")
         elif k == pygame.K_p:
             self.save_photo()
         elif k == pygame.K_F2:
@@ -999,6 +1063,22 @@ class App:
             self.prompt = Prompt("Mission 5 pole order",
                                  [("Order from the referee, e.g. R-B-Y", self.pole_order, validate_order)],
                                  self.apply_order)
+        elif k == pygame.K_F6:
+            self.toggle_mission5()
+        elif k == pygame.K_y and self.mission_controller is not None:
+            self.mission_controller.confirm(True, time.monotonic())
+            self.log("Mission 5: ball drop confirmed")
+        elif k == pygame.K_n and self.mission_controller is not None:
+            self.mission_controller.confirm(False, time.monotonic())
+            self.log("Mission 5: retrying current pole")
+        elif k == pygame.K_k and self.mission_controller is not None:
+            self.mission_controller.skip(time.monotonic())
+            self.log("Mission 5: skipped current pole")
+        elif k == pygame.K_F7 and self.mission_controller is not None:
+            self.pause_mission5("mission restarted")
+            self.mission_controller.reset()
+            self.mission_complete_logged = False
+            self.log("Mission 5 restarted")
         elif k == pygame.K_F4:
             if self.wifi is None:
                 self.log("Enter the Wi-Fi details first (F2)")
@@ -1046,9 +1126,41 @@ class App:
         self.log("ARMED")
 
     def disarm(self, reason):
+        self.pause_mission5(reason)
         if self.armed:
             self.armed = False
             self.log(f"Disarmed ({reason})")
+
+    def pause_mission5(self, reason=None):
+        was_running = self.mission_running
+        self.mission_running = False
+        self.mission_command = Command()
+        if was_running and reason:
+            self.log(f"Mission 5 paused ({reason})")
+
+    def toggle_mission5(self):
+        if self.mission_running:
+            self.pause_mission5("operator")
+            return
+        if self.mission_controller is None:
+            self.log("Set the Mission 5 pole order first (F3)")
+            return
+        if self.mission_controller.state == self.mission_controller.DONE:
+            self.log("Mission 5 is complete; press F7 to restart it")
+            return
+        if not self.armed:
+            self.log("Arm the ROV first (Space), then press F6")
+            return
+        if not self.serial.ready:
+            self.log("Cannot start Mission 5: ROV not connected")
+            return
+        if any(abs(value) > 0.01 for value in self.cmd.values()):
+            self.log("Cannot start Mission 5: centre controls and release drive keys")
+            return
+        self.mission_controller.resume()
+        self.mission_running = True
+        self.mission_complete_logged = False
+        self.log("Mission 5 autonomy RUNNING")
 
     def toggle_hook(self):
         self.hook_open = not self.hook_open
@@ -1080,7 +1192,14 @@ class App:
         self.send_text("FETCH")
 
     def apply_order(self, values):
-        self.pole_order = "-".join(p.strip().upper() for p in values[0].split("-"))
+        order = parse_order(values[0])
+        self.pause_mission5("new pole order")
+        self.pole_order = order_str(order)
+        self.mission_controller = MissionController(order)
+        self.mission_detector = PoleDetector(load_config())
+        self.mission_detections = {}
+        self.mission_complete_logged = False
+        self.colours_on = True
         self.log(f"Pole order set to {self.pole_order}")
         self.send_text("ORDER\t" + self.pole_order)
 
@@ -1305,10 +1424,30 @@ class App:
         self.text(f"Order: {self.pole_order or '- (press F3)'}", x, y, max_width=w)
         y += 19
         colours = " ".join(COLOUR_NAMES[c] for c in self.colours_in_view) or "-"
-        if not self.colours_on:
+        if not self.colours_on and self.mission_controller is None:
             colours = "detection off (C)"
         self.text(f"Colours in view: {colours}", x, y, max_width=w)
         y += 19
+        if self.mission_controller is not None:
+            target = self.mission_controller.target
+            detection = self.mission_detections.get(target) if target else None
+            width_text = f"{detection.width_frac:.3f}" if detection is not None else "-"
+            status = "RUNNING" if self.mission_running else "paused"
+            self.text(
+                f"{status}  state {self.mission_controller.state}  target {target or '-'}",
+                x,
+                y,
+                GOOD if self.mission_running else MUTED,
+                max_width=w,
+            )
+            y += 19
+            self.text(
+                f"Pole width {width_text}  F6 start/pause  Y/N confirm",
+                x,
+                y,
+                max_width=w,
+            )
+            y += 19
 
         y = self.section(x, y + 6, w, "Log")
         rows = max(0, (p.bottom - 8 - y) // 17)
@@ -1320,7 +1459,7 @@ class App:
     def draw_bottom_bar(self):
         y = WIN_H - 24
         hints = ("F1 help   Space arm/disarm   X disarm   G gallery   P photo   "
-                 "F2 Wi-Fi   F3 pole order   Ctrl+Q quit")
+                 "F2 Wi-Fi   F3 order   F6 autonomy   Ctrl+Q quit")
         self.text(hints, 12, y, MUTED, self.font_small)
         right = f"UI {self.clock.get_fps():.0f} fps"
         if self.serial.dry_run:
@@ -1634,6 +1773,20 @@ class Command:
     heave: float = 0.0
 
 
+def mission_command_to_axes(command):
+    """Map Mission 5 commands onto the control interface's axis convention.
+
+    Mission 5 uses positive heave for down, while the manual mixer uses
+    positive heave for up, so that axis is intentionally inverted.
+    """
+    return {
+        "surge": clamp(command.surge),
+        "sway": 0.0,
+        "heave": clamp(-command.heave),
+        "yaw": clamp(command.yaw),
+    }
+
+
 def clamp(v, lo=-1.0, hi=1.0):
     return max(lo, min(hi, v))
 
@@ -1850,6 +2003,39 @@ def draw_hud(frame, ctrl, cmd, running, fps):
         cv2.rectangle(frame, (W - 40, 10), (W - 18, 32), DRAW_BGR[ctrl.target], -1)
     help_text = "SPACE start/pause  y/n confirm  s skip  r restart  m masks  q quit"
     cv2.putText(frame, help_text, (10, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    return frame
+
+
+def draw_interface_mission_hud(frame, ctrl, cmd, armed, running, fps):
+    """Draw Mission 5 status using controls that match the Pygame interface."""
+    height, width = frame.shape[:2]
+    target = ctrl.target
+    if target:
+        # The detailed width remains next to the target bounding box; this line
+        # keeps the control state visible even while the pole is off-screen.
+        target_text = target.upper()
+    else:
+        target_text = "-"
+    lines = [
+        f"M5 {'RUNNING' if running else 'PAUSED'}  "
+        f"{'ARMED' if armed else 'DISARMED'}  STATE {ctrl.state}",
+        f"ORDER {order_str(ctrl.order)}  TARGET {target_text}",
+        f"surge {cmd.surge:+.2f}  yaw {cmd.yaw:+.2f}  "
+        f"heave {cmd.heave:+.2f}  {fps:4.1f} fps",
+    ]
+    if ctrl.state == ctrl.CONFIRM:
+        lines.append("Ball dropped? Y=yes  N=retry  K=skip")
+    elif not running:
+        lines.append("Space arm/disarm  F6 autonomy start/pause")
+    y = 22
+    for text in lines:
+        color = (0, 255, 120) if running else (0, 220, 255)
+        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, color, 1, cv2.LINE_AA)
+        y += 21
+    cv2.line(frame, (width // 2, 0), (width // 2, height), (200, 200, 200), 1)
     return frame
 
 

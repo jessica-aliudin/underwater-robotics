@@ -1,4 +1,4 @@
-"""Tests for Mission 5. Run:  python -m unittest -v test_mission5
+"""Tests for Mission 5. Run:  python -m unittest -v test_all_missions
 
 - order parsing
 - detector on synthetic underwater images (blue-green cast, noise, decoys)
@@ -22,6 +22,7 @@ from all_missions import (
     Detection,
     MissionController,
     PoleDetector,
+    mission_command_to_axes,
     parse_order,
 )
 
@@ -115,6 +116,13 @@ def fake_det(color, err_x=0.0, width_frac=0.03):
 
 
 class TestController(unittest.TestCase):
+    def test_command_maps_to_interface_axes(self):
+        axes = mission_command_to_axes(Command(surge=0.4, yaw=-0.2, heave=0.3))
+        self.assertEqual(
+            axes,
+            {"surge": 0.4, "sway": 0.0, "heave": -0.3, "yaw": -0.2},
+        )
+
     def test_full_cycle_for_one_pole(self):
         ctrl = MissionController(["blue", "red", "yellow"])
         t = 0.0
