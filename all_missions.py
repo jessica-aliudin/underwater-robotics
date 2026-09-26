@@ -195,6 +195,7 @@ HELP_RIGHT = [
     ("F6", "Mission 5 autonomy start / pause"),
     ("Y / N", "ball dropped / retry"),
     ("K / F7", "skip target / restart mission"),
+    ("F8", "choose camera / video / demo"),
     ("C", "simple colour detection on / off"),
     ("Other", None),
     ("P", "save a photo of the camera view"),
@@ -274,6 +275,20 @@ def validate_order(text):
     if sorted(parts) != ["B", "R", "Y"]:
         return "Use R, Y and B once each, joined by hyphens, e.g. R-B-Y"
     return None
+
+
+def validate_camera_source(text):
+    return None if text.strip() else "Enter a camera index, video path, or demo"
+
+
+def parse_camera_source(text):
+    """Convert an interface camera entry into an OpenCV source value."""
+    value = str(text).strip()
+    if not value:
+        raise ValueError("Camera source cannot be empty")
+    if value.lower() == "demo":
+        return "demo"
+    return int(value) if value.isdigit() else value
 
 
 def aruco_dictionary(family):
@@ -454,7 +469,9 @@ class CameraSource:
         self._frame = None
         self._lock = threading.Lock()
         self._running = True
-        threading.Thread(target=self._run, daemon=True).start()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def _open(self):
         if isinstance(self.source, int):
@@ -478,7 +495,7 @@ class CameraSource:
                     cap.release()
                     cap = None
                     self.status = f"{self.source} not found"
-                    time.sleep(2.0)
+                    self._stop_event.wait(2.0)
                     continue
                 self.status = "ok"
                 delay = 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 30.0) if is_file else 0.0
@@ -491,7 +508,7 @@ class CameraSource:
                 self.status = "no picture, reconnecting"
                 cap.release()
                 cap, failures = None, 0
-                time.sleep(1.0)
+                self._stop_event.wait(1.0)
                 continue
             failures = 0
             with self._lock:
@@ -502,7 +519,7 @@ class CameraSource:
             if elapsed >= 1.0:
                 self.fps, count, t0 = count / elapsed, 0, time.time()
             if delay:
-                time.sleep(delay)
+                self._stop_event.wait(delay)
         if cap is not None:
             cap.release()
 
@@ -512,6 +529,9 @@ class CameraSource:
 
     def stop(self):
         self._running = False
+        self._stop_event.set()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.5)
 
 
 class DemoSource:
@@ -519,6 +539,7 @@ class DemoSource:
     getting closer and further away, plus red, yellow and blue balls."""
 
     def __init__(self, width, height, family, tag_ids=(7, 23, 12)):
+        self.source = "demo"
         self.width, self.height = width, height
         self.status = "demo"
         self.fps = 30.0
@@ -808,11 +829,8 @@ class App:
 
         self.detector = TagDetector(args.family)
         self.tracker = TagTracker(CAPTURE_ROOT)
-        if args.camera == "demo":
-            self.camera = DemoSource(CAMERA_WIDTH, CAMERA_HEIGHT, args.family)
-        else:
-            source = int(args.camera) if args.camera.isdigit() else args.camera
-            self.camera = CameraSource(source, CAMERA_WIDTH, CAMERA_HEIGHT)
+        self.camera_selection = str(args.camera).strip()
+        self.camera = self.make_camera_source(self.camera_selection)
         self.serial = SerialLink(args.port, args.baud, args.dry_run, self.log,
                                  on_connect=self.on_serial_connect, on_lost=self.on_serial_lost)
         self.log("Ready. Press F1 for help.")
@@ -1079,6 +1097,8 @@ class App:
             self.mission_controller.reset()
             self.mission_complete_logged = False
             self.log("Mission 5 restarted")
+        elif k == pygame.K_F8:
+            self.open_camera_prompt()
         elif k == pygame.K_F4:
             if self.wifi is None:
                 self.log("Enter the Wi-Fi details first (F2)")
@@ -1169,6 +1189,36 @@ class App:
     def set_speed(self, index):
         self.speed_index = max(0, min(len(SPEED_STEPS) - 1, index))
         self.log(f"Speed {int(SPEED_STEPS[self.speed_index] * 100)}%")
+
+    def make_camera_source(self, selection):
+        source = parse_camera_source(selection)
+        if source == "demo":
+            return DemoSource(CAMERA_WIDTH, CAMERA_HEIGHT, self.family)
+        return CameraSource(source, CAMERA_WIDTH, CAMERA_HEIGHT)
+
+    def open_camera_prompt(self):
+        fields = [
+            ("Camera index, video path, or 'demo'", self.camera_selection,
+             validate_camera_source),
+        ]
+        self.prompt = Prompt("Choose camera", fields, self.apply_camera)
+
+    def apply_camera(self, values):
+        selection = values[0].strip()
+        self.disarm("camera changed")
+        self.camera.stop()
+        self.camera_selection = selection
+        self.camera = self.make_camera_source(selection)
+        self.last_frame_id = -1
+        self.frame_surface = None
+        self.last_display = None
+        self.mission_last_frame_at = None
+        self.mission_command = Command()
+        self.mission_detections = {}
+        self.in_view = []
+        self.colours_in_view = []
+        self._cache.clear()
+        self.log(f"Camera switched to {selection}")
 
     def open_wifi_prompt(self):
         ssid, password, url = self.wifi or (
@@ -1277,7 +1327,7 @@ class App:
             colour = GOOD if self.serial.ready else BAD
         x = self.pill(x, 10, self.serial.status, colour)
         camera_ok = self.frame_surface is not None and self.camera.status in ("ok", "demo")
-        label = f"camera {self.camera.status}"
+        label = f"camera {self.camera_selection}: {self.camera.status}"
         if len(label) > 34:
             label = label[:31] + "..."
         self.pill(x, 10, label, GOOD if camera_ok else BAD)
@@ -1459,7 +1509,7 @@ class App:
     def draw_bottom_bar(self):
         y = WIN_H - 24
         hints = ("F1 help   Space arm/disarm   X disarm   G gallery   P photo   "
-                 "F2 Wi-Fi   F3 order   F6 autonomy   Ctrl+Q quit")
+                 "F2 Wi-Fi   F3 order   F6 autonomy   F8 camera   Ctrl+Q quit")
         self.text(hints, 12, y, MUTED, self.font_small)
         right = f"UI {self.clock.get_fps():.0f} fps"
         if self.serial.dry_run:

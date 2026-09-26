@@ -23,6 +23,7 @@ from all_missions import (
     MissionController,
     PoleDetector,
     mission_command_to_axes,
+    parse_camera_source,
     parse_order,
 )
 
@@ -66,6 +67,20 @@ class TestParseOrder(unittest.TestCase):
         for bad in ["R-R-Y", "R-B", "R-B-Y-G", "", "R-G-B"]:
             with self.assertRaises(ValueError, msg=bad):
                 parse_order(bad)
+
+
+class TestCameraSource(unittest.TestCase):
+    def test_camera_indices_are_integers(self):
+        self.assertEqual(parse_camera_source("0"), 0)
+        self.assertEqual(parse_camera_source(" 5 "), 5)
+
+    def test_demo_and_video_paths_remain_strings(self):
+        self.assertEqual(parse_camera_source("DEMO"), "demo")
+        self.assertEqual(parse_camera_source("pool_run.mp4"), "pool_run.mp4")
+
+    def test_empty_source_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_camera_source("   ")
 
 
 class TestDetector(unittest.TestCase):
