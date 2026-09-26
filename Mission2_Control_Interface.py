@@ -1,50 +1,28 @@
 #!/usr/bin/env python3
-"""Unified underwater-robotics application for Missions 2 and 5.
-
-Examples:
-    python mission2_and_5.py control --dry-run --camera demo
-    python mission2_and_5.py mission2 --dry-run --camera 0
-    python mission2_and_5.py camera --camera 0
-    python mission2_and_5.py tune --camera 0
-    python mission2_and_5.py mission5 --order R-B-Y --camera 0
-
-Run without a command to open the combined Mission 2/5 topside controller.
-
-Code map (search for these headings in this file):
-    SHARED   - camera, serial, thruster mixing, window, and input handling
-    MISSION 2 - AprilTag detection, capture gallery, and largest/smallest target
-    MISSION 5 - coloured-pole detection and autonomous state machine
-
-How the pieces fit together:
-    1. CameraSource supplies the newest camera frame without freezing the UI.
-    2. App sends that frame to the Mission 2 and Mission 5 processors.
-    3. Mission 2 records AprilTags; Mission 5 can produce an autonomous Command.
-    4. The shared mixer converts manual/autonomous movement into thruster values.
-    5. SerialLink sends those values to the ROV. Disarming always sends zeros.
-
-This is the topside control program for the CityUHK UR Fall Training 2026 ROV.
+"""
+rov_control.py - topside control program for the CityUHK UR Fall Training 2026 ROV.
 
 One window with:
   * live camera feed with AprilTag and colour-detection overlays
   * gamepad or keyboard driving, with arming, speed steps and a hook toggle
   * thruster output bars
+  * Mission 1:   send the Wi-Fi details to the ESP32 and show the text it retrieves
   * Mission 2.1: remembers every AprilTag seen, picks the largest/smallest ID,
                  and keeps the clearest photo of each tag
   * Gallery (G): photos of the LOWEST and HIGHEST tag IDs side by side, plus
                  thumbnails of every tag captured. Photos are also saved as JPGs.
-  * Mission 5:   detect, align with, approach, and hit coloured poles in the
-                 referee's order using the same camera and serial thruster link
+  * Mission 5:   enter the pole order (e.g. R-B-Y) and send it to the ROV
 
 Install (Python 3.9+):
     pip install pygame opencv-python pyserial numpy
     (OpenCV 4.7 or newer is needed for the AprilTag detector.)
 
 Run:
-    python mission2_and_5.py --camera demo --dry-run   no hardware at all: fake tags, nothing sent
-    python mission2_and_5.py --dry-run                 laptop webcam, commands shown but not sent
-    python mission2_and_5.py --port COM3 --camera 1    real ROV on COM3, USB camera number 1
-    python mission2_and_5.py --camera pool_run.mp4     replay a recorded video
-    python mission2_and_5.py --list-ports              list serial ports and exit
+    python rov_control.py --camera demo --dry-run   no hardware at all: fake tags, nothing sent
+    python rov_control.py --dry-run                 laptop webcam, commands shown but not sent
+    python rov_control.py --port COM3 --camera 1    real ROV on COM3, USB camera number 1
+    python rov_control.py --camera pool_run.mp4     replay a recorded video
+    python rov_control.py --list-ports              list serial ports and exit
 
 Photos are saved in ./captures/<date_time>/ :
     tag_007.jpg, tag_023.jpg, ...   clearest photo of each tag ID
@@ -56,8 +34,11 @@ Serial protocol (text lines, 115200 baud). Your ESP32 firmware must match this:
     T,<armed>,<hook>,<t1>,...,<tN>     about 30 times per second
                                        armed: 0/1   hook: 0 = closed, 1 = open
                                        thrusters: -100..100 percent, 0 = stop
+    WIFI\t<ssid>\t<password>\t<url>    Mission 1 settings (tab-separated)
+    FETCH                              ESP32 joins the Wi-Fi, does an HTTP GET, replies MSG
     ORDER\t<R-B-Y>                     Mission 5 pole order
   ROV -> laptop
+    MSG\t<text>                        the text the ESP32 retrieved (Mission 1)
     LOG\t<text>                        status messages, shown in the log panel
   FAILSAFE (firmware side): if no T line arrives for 500 ms, stop every thruster.
 """
@@ -87,7 +68,7 @@ except ImportError:
 
 
 # =============================================================================
-# SHARED CONFIGURATION - edit this section to match your ROV
+# CONFIGURATION - edit this section to match your ROV
 # =============================================================================
 
 # Thruster layout. Each thruster lists how much it pushes for each motion:
@@ -128,15 +109,11 @@ BAUD = 115200
 SEND_HZ = 30
 
 CAMERA_WIDTH, CAMERA_HEIGHT = 640, 480
-
-# MISSION 2 CONFIGURATION: AprilTag confirmation and saved photographs.
 TAG_CONFIRM_FRAMES = 3      # a tag must be seen in this many frames before it counts
 TAG_BETTER_FACTOR = 1.15    # replace a tag's photo when it appears 15% bigger (closer, clearer)
 CAPTURE_ROOT = Path("captures")
 
-# MISSION 5 CONFIGURATION: simple preview detection in OpenCV HSV (hue 0-180).
-# The full autonomous detector configuration is in the Mission 5 section below.
-# Pool lighting and
+# Colour detection for Mission 5, in OpenCV HSV (hue 0-180). Pool lighting and
 # water shift colours, so tune these with pool footage. A blue pool floor can
 # trigger "B"; raise the blue saturation minimum if that happens.
 COLOUR_RANGES = {
@@ -194,16 +171,14 @@ HELP_LEFT = [
 ]
 HELP_RIGHT = [
     ("Missions", None),
+    ("F2", "Mission 1: enter Wi-Fi, fetch"),
+    ("F4", "Mission 1: fetch again"),
     ("M", "Mission 2.1: largest or smallest"),
     ("T", "AprilTag detection on / off"),
     ("G", "gallery: lowest/highest tags"),
     ("F5 twice", "clear captured tags"),
     ("F3", "Mission 5: pole order"),
-    ("F6", "Mission 5 autonomy start / pause"),
-    ("Y / N", "ball dropped / retry"),
-    ("K / F7", "skip target / restart mission"),
-    ("F8", "choose camera / video / demo"),
-    ("C", "simple colour detection on / off"),
+    ("C", "colour detection on / off"),
     ("Other", None),
     ("P", "save a photo of the camera view"),
     ("F1 / Esc", "close this help"),
@@ -212,11 +187,10 @@ HELP_RIGHT = [
 
 
 # =============================================================================
-# SHARED HELPERS
+# Small helpers
 # =============================================================================
 
 def clamp(value, low=-1.0, high=1.0):
-    """Keep a number inside a safe range; motor commands normally use -1 to +1."""
     return max(low, min(high, value))
 
 
@@ -264,49 +238,41 @@ def cv_to_surface(image, size):
 
 
 def fmt_ids(ids):
-    """Make a short ID list for the panel, using '-' when nothing is available."""
     return ", ".join(str(i) for i in ids) if ids else "-"
 
 
+def validate_not_empty(text):
+    return None if text.strip() else "This cannot be empty"
+
+
+def validate_url(text):
+    t = text.strip()
+    if not t.lower().startswith(("http://", "https://")) or len(t) <= len("http://") or " " in t:
+        return "Enter the full address from the referee, e.g. http://192.168.1.10/"
+    return None
+
+
 def validate_order(text):
-    """Return a friendly prompt error unless the entry is R/Y/B exactly once."""
     parts = [p.strip().upper() for p in text.split("-")]
     if sorted(parts) != ["B", "R", "Y"]:
         return "Use R, Y and B once each, joined by hyphens, e.g. R-B-Y"
     return None
 
 
-def validate_camera_source(text):
-    """The prompt accepts camera numbers, video paths, or the built-in demo."""
-    return None if text.strip() else "Enter a camera index, video path, or demo"
-
-
-def parse_camera_source(text):
-    """Convert an interface camera entry into an OpenCV source value."""
-    value = str(text).strip()
-    if not value:
-        raise ValueError("Camera source cannot be empty")
-    if value.lower() == "demo":
-        return "demo"
-    return int(value) if value.isdigit() else value
-
-
 def aruco_dictionary(family):
-    """Translate the readable family name into OpenCV's AprilTag dictionary."""
     if not hasattr(cv2, "aruco"):
         sys.exit("This OpenCV has no AprilTag support. Run: pip install --upgrade opencv-python")
     return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, TAG_FAMILIES[family]))
 
 
 def generate_marker(dictionary, tag_id, size):
-    """Create a demo AprilTag while supporting both old and new OpenCV APIs."""
     if hasattr(cv2.aruco, "generateImageMarker"):
         return cv2.aruco.generateImageMarker(dictionary, tag_id, size)
     return cv2.aruco.drawMarker(dictionary, tag_id, size)
 
 
 # =============================================================================
-# MISSION 2 - APRILTAG DETECTION AND CAPTURE
+# Vision
 # =============================================================================
 
 class TagDetector:
@@ -346,7 +312,6 @@ class TagTracker:
         self.reset()
 
     def reset(self):
-        """Forget the current run and prepare a new timestamped capture folder."""
         self.capture_dir = self.root / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.hits = {}        # tag id -> number of frames it has been seen in
         self.best = {}        # tag id -> {"image", "area", "time"}
@@ -356,19 +321,15 @@ class TagTracker:
 
     @property
     def ids(self):
-        """Every confirmed tag ID, sorted so the gallery stays predictable."""
         return sorted(self.best)
 
     def lowest(self):
-        """The smallest confirmed ID, or None before any tag has been captured."""
         return min(self.best) if self.best else None
 
     def highest(self):
-        """The largest confirmed ID, or None before any tag has been captured."""
         return max(self.best) if self.best else None
 
     def target(self, mode):
-        """Mission 2 target: choose the highest or lowest tag requested by the referee."""
         return self.highest() if mode == "largest" else self.lowest()
 
     def update(self, detections, frame):
@@ -421,12 +382,6 @@ class TagTracker:
             cv2.imwrite(str(self.capture_dir / "highest.jpg"), self.best[self.highest()]["image"])
 
 
-# =============================================================================
-# MISSION 5 - SIMPLE COLOUR PREVIEW
-# Used when colour detection is enabled before an autonomous order is loaded.
-# The full autonomous PoleDetector is in the dedicated Mission 5 section below.
-# =============================================================================
-
 def detect_colours(frame):
     """Returns a list of (colour letter, (x, y, w, h), area) for red/yellow/blue blobs."""
     hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV)
@@ -447,7 +402,6 @@ def detect_colours(frame):
 
 
 def draw_tag_overlays(image, detections, target_id):
-    """Draw visible tag boxes; the selected Mission 2 target gets a thicker label."""
     for tag_id, pts, _ in detections:
         corners = pts.astype(np.int32)
         is_target = tag_id == target_id
@@ -461,7 +415,6 @@ def draw_tag_overlays(image, detections, target_id):
 
 
 def draw_colour_overlays(image, found):
-    """Draw the lightweight colour-preview boxes used before Mission 5 is started."""
     for name, (x, y, w, h), _ in found:
         colour = COLOUR_BGR[name]
         cv2.rectangle(image, (x, y), (x + w, y + h), colour, 2)
@@ -470,7 +423,7 @@ def draw_colour_overlays(image, found):
 
 
 # =============================================================================
-# SHARED CAMERA SOURCES
+# Video sources
 # =============================================================================
 
 class CameraSource:
@@ -484,9 +437,7 @@ class CameraSource:
         self._frame = None
         self._lock = threading.Lock()
         self._running = True
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        threading.Thread(target=self._run, daemon=True).start()
 
     def _open(self):
         if isinstance(self.source, int):
@@ -510,7 +461,7 @@ class CameraSource:
                     cap.release()
                     cap = None
                     self.status = f"{self.source} not found"
-                    self._stop_event.wait(2.0)
+                    time.sleep(2.0)
                     continue
                 self.status = "ok"
                 delay = 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 30.0) if is_file else 0.0
@@ -523,7 +474,7 @@ class CameraSource:
                 self.status = "no picture, reconnecting"
                 cap.release()
                 cap, failures = None, 0
-                self._stop_event.wait(1.0)
+                time.sleep(1.0)
                 continue
             failures = 0
             with self._lock:
@@ -534,7 +485,7 @@ class CameraSource:
             if elapsed >= 1.0:
                 self.fps, count, t0 = count / elapsed, 0, time.time()
             if delay:
-                self._stop_event.wait(delay)
+                time.sleep(delay)
         if cap is not None:
             cap.release()
 
@@ -544,9 +495,6 @@ class CameraSource:
 
     def stop(self):
         self._running = False
-        self._stop_event.set()
-        if self._thread is not threading.current_thread():
-            self._thread.join(timeout=2.5)
 
 
 class DemoSource:
@@ -554,7 +502,6 @@ class DemoSource:
     getting closer and further away, plus red, yellow and blue balls."""
 
     def __init__(self, width, height, family, tag_ids=(7, 23, 12)):
-        self.source = "demo"
         self.width, self.height = width, height
         self.status = "demo"
         self.fps = 30.0
@@ -586,12 +533,11 @@ class DemoSource:
         return cv2.add(frame, np.random.randint(0, 12, frame.shape, np.uint8))
 
     def stop(self):
-        # Kept for the same interface as CameraSource; the demo owns no hardware.
         pass
 
 
 # =============================================================================
-# SHARED SERIAL LINK TO THE ROV CONTROLLER
+# Serial link to the ESP32
 # =============================================================================
 
 class SerialLink:
@@ -620,7 +566,6 @@ class SerialLink:
 
     @property
     def ready(self):
-        """Dry-run counts as ready so the interface can be practised without hardware."""
         return self.dry_run or self.ser is not None
 
     @property
@@ -632,7 +577,6 @@ class SerialLink:
         return "ROV not connected"
 
     def _find_port(self):
-        """Use the requested COM port, or look for common ESP32 USB adapters."""
         if self.requested_port:
             return self.requested_port
         for p in serial.tools.list_ports.comports():
@@ -691,7 +635,6 @@ class SerialLink:
             self.on_lost()
 
     def send(self, line):
-        """Send one newline-terminated command; False means there is no usable link."""
         if self.dry_run:
             return True
         error = None
@@ -724,7 +667,6 @@ class SerialLink:
                 self._incoming.put(raw.decode("utf-8", errors="replace").strip())
 
     def poll(self):
-        """Return every complete line received since the last UI frame."""
         lines = []
         while True:
             try:
@@ -733,7 +675,6 @@ class SerialLink:
                 return lines
 
     def close(self):
-        """Stop the reader loop and release the serial port during shutdown."""
         self._running = False
         with self._lock:
             s, self.ser = self.ser, None
@@ -745,12 +686,10 @@ class SerialLink:
 
 
 # =============================================================================
-# SHARED TEXT-ENTRY PROMPT
+# Text entry box (Wi-Fi details, pole order)
 # =============================================================================
 
 class Prompt:
-    """Small in-app form used for values such as pole order and camera number."""
-
     def __init__(self, title, fields, on_done):
         """fields: list of (label, default text, validator or None)."""
         self.title = title
@@ -793,18 +732,10 @@ class Prompt:
 
 
 # =============================================================================
-# SHARED INTERFACE - CONNECTS MISSION 2 AND MISSION 5
-#
-# Mission-specific work is kept in explicitly named methods:
-#   process_mission2_frame / draw_mission2_panel
-#   process_mission5_frame / draw_mission5_panel
-# Mission 5's classes are defined later in the file. That is safe because
-# Python finishes loading the file before main() creates this App.
+# Main application
 # =============================================================================
 
 class App:
-    """The main Pygame window and the meeting point for shared, Mission 2, and Mission 5 code."""
-
     def __init__(self, args):
         pygame.display.init()   # only what we need: no audio, so no sound-card errors
         pygame.font.init()
@@ -827,33 +758,22 @@ class App:
         self.armed = False
         self.hook_open = False
         self.speed_index = DEFAULT_SPEED_INDEX
-
-        # Mission 2 state (AprilTags and capture gallery).
         self.mode = args.mode
         self.family = args.family
         self.tags_on = True
-        self.gallery = False
-        self.in_view = []
-
-        # Mission 5 state (coloured poles and autonomous controller).
         self.colours_on = False
-        self.pole_order = ""
-        self.mission_detector = PoleDetector(load_config())
-        self.mission_controller = None
-        self.mission_running = False
-        self.mission_command = Command()
-        self.mission_detections = {}
-        self.mission_last_frame_at = None
-        self.mission_complete_logged = False
-        self.colours_in_view = []
-
-        # Shared interface, drive, and camera state.
+        self.gallery = False
         self.show_help = False
         self.prompt = None
         self.reset_pressed_at = 0.0
+        self.wifi = None
+        self.pole_order = ""
+        self.wifi_message = ""
         self.joystick = None
         self.cmd = {axis: 0.0 for axis in AXES_ORDER}
         self.thrust = [0] * len(THRUSTERS)
+        self.in_view = []
+        self.colours_in_view = []
         self.frame_surface = None
         self.last_display = None
         self.last_frame_id = -1
@@ -864,8 +784,11 @@ class App:
 
         self.detector = TagDetector(args.family)
         self.tracker = TagTracker(CAPTURE_ROOT)
-        self.camera_selection = str(args.camera).strip()
-        self.camera = self.make_camera_source(self.camera_selection)
+        if args.camera == "demo":
+            self.camera = DemoSource(CAMERA_WIDTH, CAMERA_HEIGHT, args.family)
+        else:
+            source = int(args.camera) if args.camera.isdigit() else args.camera
+            self.camera = CameraSource(source, CAMERA_WIDTH, CAMERA_HEIGHT)
         self.serial = SerialLink(args.port, args.baud, args.dry_run, self.log,
                                  on_connect=self.on_serial_connect, on_lost=self.on_serial_lost)
         self.log("Ready. Press F1 for help.")
@@ -884,29 +807,12 @@ class App:
             self.step()
 
     def step(self):
-        """Run one UI frame: inputs -> vision -> command choice -> thrusters -> drawing."""
         for event in pygame.event.get():
             self.handle_event(event)
         self.serial.maintain()
         self.handle_serial_lines()
         self.update_camera()
-        manual_cmd = self.read_commands()
-        now = time.monotonic()
-        if self.mission_running:
-            # Mission 5 may drive only while armed, receiving frames, and not
-            # being overridden by the operator. Any of these conditions wins
-            # over autonomy because stopping safely matters more than progress.
-            if not self.armed:
-                self.pause_mission5("ROV disarmed")
-            elif self.mission_last_frame_at is None or now - self.mission_last_frame_at > 1.0:
-                self.disarm("Mission 5 camera feed lost")
-            elif any(abs(value) > 0.01 for value in manual_cmd.values()):
-                self.pause_mission5("manual override")
-                self.cmd = manual_cmd
-            else:
-                self.cmd = mission_command_to_axes(self.mission_command)
-        else:
-            self.cmd = manual_cmd
+        self.cmd = self.read_commands()
         speed = SPEED_STEPS[self.speed_index]
         self.thrust = mix(self.cmd, speed) if self.armed else [0] * len(THRUSTERS)
         self.send_command()
@@ -916,7 +822,6 @@ class App:
         self.clock.tick(60)
 
     def shutdown(self):
-        """Stop the motors first, then close serial, camera, saved photos, and Pygame."""
         if self._closed:
             return
         self._closed = True
@@ -939,7 +844,6 @@ class App:
             self.log("Not sent: ROV not connected")
 
     def send_command(self):
-        """Send the current arm/hook/thruster state at a fixed rate."""
         now = time.time()
         if now < self.next_send:
             return
@@ -949,7 +853,9 @@ class App:
         self.serial.send(self.last_sent)
 
     def on_serial_connect(self):
-        # The controller may have rebooted, so send the mission settings again.
+        # The ESP32 may have rebooted, so send the mission settings again.
+        if self.wifi:
+            self.serial.send("WIFI\t" + "\t".join(self.wifi))
         if self.pole_order:
             self.serial.send("ORDER\t" + self.pole_order)
 
@@ -957,16 +863,17 @@ class App:
         self.disarm("serial connection lost")
 
     def handle_serial_lines(self):
-        """Move messages from the background serial reader into the on-screen log."""
         for line in self.serial.poll():
-            if line.startswith("LOG\t"):
+            if line.startswith("MSG\t"):
+                self.wifi_message = line[4:]
+                self.log("Wi-Fi message received from the ROV")
+            elif line.startswith("LOG\t"):
                 self.log("ROV: " + line[4:])
             elif line:
                 self.log("ROV: " + line)
 
-    # ---------------------------------------------------------- shared camera
+    # ---------------------------------------------------------------- camera
     def update_camera(self):
-        """Read one frame, then let Mission 2 and Mission 5 process it separately."""
         frame_id = self.camera.frame_id
         if frame_id == self.last_frame_id:
             return
@@ -975,17 +882,6 @@ class App:
             return
         self.last_frame_id = frame_id
         display = frame.copy()
-
-        self.process_mission2_frame(frame, display)
-        self.process_mission5_frame(frame, display)
-
-        self.last_display = display
-        size = fit_size(display.shape[1], display.shape[0], VIEW.width, VIEW.height)
-        self.frame_surface = cv_to_surface(display, size)
-
-    # --------------------------------------------------------------- Mission 2
-    def process_mission2_frame(self, frame, display):
-        """Detect AprilTags, update saved captures, and draw Mission 2 overlays."""
         if self.tags_on:
             detections = self.detector.detect(frame)
             self.in_view = sorted({d[0] for d in detections})
@@ -994,53 +890,15 @@ class App:
             draw_tag_overlays(display, detections, self.tracker.target(self.mode))
         else:
             self.in_view = []
-
-    # --------------------------------------------------------------- Mission 5
-    def process_mission5_frame(self, frame, display):
-        """Run pole detection and, when enabled, advance Mission 5 autonomy."""
-        if self.mission_controller is not None:
-            now = time.monotonic()
-            self.mission_last_frame_at = now
-            self.mission_detections = self.mission_detector.detect(frame)
-            self.colours_in_view = [
-                color[0].upper()
-                for color in COLORS
-                if self.mission_detections.get(color) is not None
-            ]
-            if self.mission_running and self.armed:
-                self.mission_command = self.mission_controller.update(
-                    self.mission_detections, now
-                )
-            else:
-                self.mission_command = Command()
-            draw_detections(
-                display,
-                self.mission_detections,
-                self.mission_controller.target,
-            )
-            draw_interface_mission_hud(
-                display,
-                self.mission_controller,
-                self.mission_command,
-                self.armed,
-                self.mission_running,
-                self.camera.fps,
-            )
-            if (
-                self.mission_controller.state == self.mission_controller.DONE
-                and not self.mission_complete_logged
-            ):
-                self.mission_complete_logged = True
-                self.mission_running = False
-                self.mission_command = Command()
-                self.log(f"Mission 5 complete: {self.mission_controller.results}")
-                self.disarm("Mission 5 complete")
-        elif self.colours_on:
+        if self.colours_on:
             found = detect_colours(frame)
             self.colours_in_view = sorted({f[0] for f in found}, key="RYB".index)
             draw_colour_overlays(display, found)
         else:
             self.colours_in_view = []
+        self.last_display = display
+        size = fit_size(display.shape[1], display.shape[0], VIEW.width, VIEW.height)
+        self.frame_surface = cv_to_surface(display, size)
 
     def save_photo(self):
         if self.last_display is None:
@@ -1109,27 +967,31 @@ class App:
             self.toggle_hook()
         elif k in speed_keys:
             self.set_speed(speed_keys[k])
-        elif k == pygame.K_p:
-            self.save_photo()
-        elif k == pygame.K_F8:
-            self.open_camera_prompt()
-        else:
-            handled_by_mission2 = self.handle_mission2_key(k)
-            if not handled_by_mission2:
-                self.handle_mission5_key(k)
-
-    # --------------------------------------------------------------- Mission 2
-    def handle_mission2_key(self, key):
-        """Handle only Mission 2 controls. Return True when the key was used."""
-        if key == pygame.K_g:
+        elif k == pygame.K_g:
             self.gallery = not self.gallery
-        elif key == pygame.K_m:
+        elif k == pygame.K_m:
             self.mode = "smallest" if self.mode == "largest" else "largest"
             self.log(f"Mission 2.1 mode: {self.mode}")
-        elif key == pygame.K_t:
+        elif k == pygame.K_t:
             self.tags_on = not self.tags_on
             self.log(f"AprilTag detection {'on' if self.tags_on else 'off'}")
-        elif key == pygame.K_F5:
+        elif k == pygame.K_c:
+            self.colours_on = not self.colours_on
+            self.log(f"Colour detection {'on' if self.colours_on else 'off'}")
+        elif k == pygame.K_p:
+            self.save_photo()
+        elif k == pygame.K_F2:
+            self.open_wifi_prompt()
+        elif k == pygame.K_F3:
+            self.prompt = Prompt("Mission 5 pole order",
+                                 [("Order from the referee, e.g. R-B-Y", self.pole_order, validate_order)],
+                                 self.apply_order)
+        elif k == pygame.K_F4:
+            if self.wifi is None:
+                self.log("Enter the Wi-Fi details first (F2)")
+            else:
+                self.send_text("FETCH")
+        elif k == pygame.K_F5:
             now = time.time()
             if now - self.reset_pressed_at < 2.0:
                 self.tracker.reset()
@@ -1138,46 +1000,6 @@ class App:
             else:
                 self.reset_pressed_at = now
                 self.log("Press F5 again within 2 s to clear captured tags")
-        else:
-            return False
-        return True
-
-    # --------------------------------------------------------------- Mission 5
-    def handle_mission5_key(self, key):
-        """Handle only Mission 5 controls. Return True when the key was used."""
-        if key == pygame.K_c:
-            if self.mission_controller is not None:
-                self.log("Mission 5 pole detection stays on while an order is loaded")
-            else:
-                self.colours_on = not self.colours_on
-                self.log(f"Colour detection {'on' if self.colours_on else 'off'}")
-        elif key == pygame.K_F3:
-            self.prompt = Prompt("Mission 5 pole order",
-                                 [("Order from the referee, e.g. R-B-Y", self.pole_order, validate_order)],
-                                 self.apply_order)
-        elif key == pygame.K_F6:
-            self.toggle_mission5()
-        elif key == pygame.K_y:
-            if self.mission_controller is not None:
-                self.mission_controller.confirm(True, time.monotonic())
-                self.log("Mission 5: ball drop confirmed")
-        elif key == pygame.K_n:
-            if self.mission_controller is not None:
-                self.mission_controller.confirm(False, time.monotonic())
-                self.log("Mission 5: retrying current pole")
-        elif key == pygame.K_k:
-            if self.mission_controller is not None:
-                self.mission_controller.skip(time.monotonic())
-                self.log("Mission 5: skipped current pole")
-        elif key == pygame.K_F7:
-            if self.mission_controller is not None:
-                self.pause_mission5("mission restarted")
-                self.mission_controller.reset()
-                self.mission_complete_logged = False
-                self.log("Mission 5 restarted")
-        else:
-            return False
-        return True
 
     def read_commands(self):
         cmd = {axis: 0.0 for axis in AXES_ORDER}
@@ -1211,41 +1033,9 @@ class App:
         self.log("ARMED")
 
     def disarm(self, reason):
-        self.pause_mission5(reason)
         if self.armed:
             self.armed = False
             self.log(f"Disarmed ({reason})")
-
-    def pause_mission5(self, reason=None):
-        was_running = self.mission_running
-        self.mission_running = False
-        self.mission_command = Command()
-        if was_running and reason:
-            self.log(f"Mission 5 paused ({reason})")
-
-    def toggle_mission5(self):
-        if self.mission_running:
-            self.pause_mission5("operator")
-            return
-        if self.mission_controller is None:
-            self.log("Set the Mission 5 pole order first (F3)")
-            return
-        if self.mission_controller.state == self.mission_controller.DONE:
-            self.log("Mission 5 is complete; press F7 to restart it")
-            return
-        if not self.armed:
-            self.log("Arm the ROV first (Space), then press F6")
-            return
-        if not self.serial.ready:
-            self.log("Cannot start Mission 5: ROV not connected")
-            return
-        if any(abs(value) > 0.01 for value in self.cmd.values()):
-            self.log("Cannot start Mission 5: centre controls and release drive keys")
-            return
-        self.mission_controller.resume()
-        self.mission_running = True
-        self.mission_complete_logged = False
-        self.log("Mission 5 autonomy RUNNING")
 
     def toggle_hook(self):
         self.hook_open = not self.hook_open
@@ -1255,45 +1045,25 @@ class App:
         self.speed_index = max(0, min(len(SPEED_STEPS) - 1, index))
         self.log(f"Speed {int(SPEED_STEPS[self.speed_index] * 100)}%")
 
-    def make_camera_source(self, selection):
-        source = parse_camera_source(selection)
-        if source == "demo":
-            return DemoSource(CAMERA_WIDTH, CAMERA_HEIGHT, self.family)
-        return CameraSource(source, CAMERA_WIDTH, CAMERA_HEIGHT)
-
-    def open_camera_prompt(self):
+    def open_wifi_prompt(self):
+        ssid, password, url = self.wifi or ("UR_Field", "12345678", "http://")
         fields = [
-            ("Camera index, video path, or 'demo'", self.camera_selection,
-             validate_camera_source),
+            ("Wi-Fi name (SSID)", ssid, validate_not_empty),
+            ("Wi-Fi password", password, None),
+            ("Server address from the referee", url, validate_url),
         ]
-        self.prompt = Prompt("Choose camera", fields, self.apply_camera)
+        self.prompt = Prompt("Mission 1 Wi-Fi details", fields, self.apply_wifi)
 
-    def apply_camera(self, values):
-        selection = values[0].strip()
-        self.disarm("camera changed")
-        self.camera.stop()
-        self.camera_selection = selection
-        self.camera = self.make_camera_source(selection)
-        self.last_frame_id = -1
-        self.frame_surface = None
-        self.last_display = None
-        self.mission_last_frame_at = None
-        self.mission_command = Command()
-        self.mission_detections = {}
-        self.in_view = []
-        self.colours_in_view = []
-        self._cache.clear()
-        self.log(f"Camera switched to {selection}")
+    def apply_wifi(self, values):
+        ssid, password, url = values
+        self.wifi = (ssid, password, url.strip())
+        self.wifi_message = ""
+        self.log(f"Sending Wi-Fi details for {ssid} and asking the ROV to fetch")
+        self.send_text("WIFI\t" + "\t".join(self.wifi))
+        self.send_text("FETCH")
 
     def apply_order(self, values):
-        order = parse_order(values[0])
-        self.pause_mission5("new pole order")
-        self.pole_order = order_str(order)
-        self.mission_controller = MissionController(order)
-        self.mission_detector = PoleDetector(load_config())
-        self.mission_detections = {}
-        self.mission_complete_logged = False
-        self.colours_on = True
+        self.pole_order = "-".join(p.strip().upper() for p in values[0].split("-"))
         self.log(f"Pole order set to {self.pole_order}")
         self.send_text("ORDER\t" + self.pole_order)
 
@@ -1371,7 +1141,7 @@ class App:
             colour = GOOD if self.serial.ready else BAD
         x = self.pill(x, 10, self.serial.status, colour)
         camera_ok = self.frame_surface is not None and self.camera.status in ("ok", "demo")
-        label = f"camera {self.camera_selection}: {self.camera.status}"
+        label = f"camera {self.camera.status}"
         if len(label) > 34:
             label = label[:31] + "..."
         self.pill(x, 10, label, GOOD if camera_ok else BAD)
@@ -1491,8 +1261,37 @@ class App:
             self.text(f"{value:+4d}", bar_x + bar_w + 8, y)
             y += 19
 
-        y = self.draw_mission2_panel(x, y, w)
-        y = self.draw_mission5_panel(x, y, w)
+        y = self.section(x, y + 6, w, "AprilTags (Mission 2.1)")
+        target = self.tracker.target(self.mode)
+        self.text(f"Mode {self.mode}   {self.family}   detect {'on' if self.tags_on else 'OFF'}",
+                  x, y, max_width=w)
+        y += 19
+        self.text(f"In view:  {fmt_ids(self.in_view)}", x, y, max_width=w)
+        y += 19
+        self.text(f"Captured: {fmt_ids(self.tracker.ids)}", x, y, max_width=w)
+        y += 19
+        self.text(f"Target:   {target if target is not None else '-'}", x, y,
+                  GOOD if target is not None else MUTED, self.font_bold)
+        y += 19
+
+        y = self.section(x, y + 6, w, "Wi-Fi message (Mission 1)")
+        if self.wifi_message:
+            for line in self.wrap(self.wifi_message, w, self.font)[:3]:
+                self.text(line, x, y, TEXT, max_width=w)
+                y += 19
+        else:
+            hint = "Waiting for the ROV (F4 fetches again)" if self.wifi else "Press F2 to enter the Wi-Fi details"
+            self.text(hint, x, y, MUTED, max_width=w)
+            y += 19
+
+        y = self.section(x, y + 6, w, "Poles (Mission 5)")
+        self.text(f"Order: {self.pole_order or '- (press F3)'}", x, y, max_width=w)
+        y += 19
+        colours = " ".join(COLOUR_NAMES[c] for c in self.colours_in_view) or "-"
+        if not self.colours_on:
+            colours = "detection off (C)"
+        self.text(f"Colours in view: {colours}", x, y, max_width=w)
+        y += 19
 
         y = self.section(x, y + 6, w, "Log")
         rows = max(0, (p.bottom - 8 - y) // 17)
@@ -1501,60 +1300,10 @@ class App:
                 self.text(line, x, y, MUTED, self.font_small, max_width=w)
                 y += 17
 
-    # --------------------------------------------------------------- Mission 2
-    def draw_mission2_panel(self, x, y, width):
-        """Draw only Mission 2's AprilTag status block."""
-        y = self.section(x, y + 6, width, "AprilTags (Mission 2.1)")
-        target = self.tracker.target(self.mode)
-        self.text(f"Mode {self.mode}   {self.family}   detect {'on' if self.tags_on else 'OFF'}",
-                  x, y, max_width=width)
-        y += 19
-        self.text(f"In view:  {fmt_ids(self.in_view)}", x, y, max_width=width)
-        y += 19
-        self.text(f"Captured: {fmt_ids(self.tracker.ids)}", x, y, max_width=width)
-        y += 19
-        self.text(f"Target:   {target if target is not None else '-'}", x, y,
-                  GOOD if target is not None else MUTED, self.font_bold)
-        y += 19
-        return y
-
-    # --------------------------------------------------------------- Mission 5
-    def draw_mission5_panel(self, x, y, width):
-        """Draw only Mission 5's coloured-pole and autonomy status block."""
-        y = self.section(x, y + 6, width, "Poles (Mission 5)")
-        self.text(f"Order: {self.pole_order or '- (press F3)'}", x, y, max_width=width)
-        y += 19
-        colours = " ".join(COLOUR_NAMES[c] for c in self.colours_in_view) or "-"
-        if not self.colours_on and self.mission_controller is None:
-            colours = "detection off (C)"
-        self.text(f"Colours in view: {colours}", x, y, max_width=width)
-        y += 19
-        if self.mission_controller is not None:
-            target = self.mission_controller.target
-            detection = self.mission_detections.get(target) if target else None
-            width_text = f"{detection.width_frac:.3f}" if detection is not None else "-"
-            status = "RUNNING" if self.mission_running else "paused"
-            self.text(
-                f"{status}  state {self.mission_controller.state}  target {target or '-'}",
-                x,
-                y,
-                GOOD if self.mission_running else MUTED,
-                max_width=width,
-            )
-            y += 19
-            self.text(
-                f"Pole width {width_text}  F6 start/pause  Y/N confirm",
-                x,
-                y,
-                max_width=width,
-            )
-            y += 19
-        return y
-
     def draw_bottom_bar(self):
         y = WIN_H - 24
         hints = ("F1 help   Space arm/disarm   X disarm   G gallery   P photo   "
-                 "F3 order   F6 autonomy   F8 camera   Ctrl+Q quit")
+                 "F2 Wi-Fi   F3 pole order   Ctrl+Q quit")
         self.text(hints, 12, y, MUTED, self.font_small)
         right = f"UI {self.clock.get_fps():.0f} fps"
         if self.serial.dry_run:
@@ -1610,11 +1359,8 @@ class App:
 
 
 # =============================================================================
-# SHARED INTERFACE STARTUP
-# =============================================================================
 
-def parse_control_args(argv=None):
-    """Read options for the combined Pygame control interface."""
+def parse_args():
     parser = argparse.ArgumentParser(description="ROV topside control program")
     parser.add_argument("--camera", default="0",
                         help="camera number (0, 1, ...), a video file path, or 'demo' for a fake scene")
@@ -1628,12 +1374,11 @@ def parse_control_args(argv=None):
     parser.add_argument("--mode", choices=("largest", "smallest"), default="largest",
                         help="your assigned Mission 2.1 rule")
     parser.add_argument("--list-ports", action="store_true", help="list serial ports and exit")
-    return parser.parse_args(argv)
+    return parser.parse_args()
 
 
-def run_control_interface(argv=None):
-    """Start the shared interface and guarantee a safe shutdown if it exits."""
-    args = parse_control_args(argv)
+def main():
+    args = parse_args()
     if args.list_ports:
         if serial is None:
             sys.exit("pyserial is not installed. Run: pip install pyserial")
@@ -1648,828 +1393,6 @@ def run_control_interface(argv=None):
         app.run()
     finally:
         app.shutdown()
-
-# =============================================================================
-# MISSION 5 - AUTONOMOUS COLOURED-POLE SYSTEM
-#
-# This section contains the complete Mission 5 implementation:
-#   configuration -> detection -> state machine -> standalone runtime tools
-# =============================================================================
-
-"""Mission 5: find the coloured poles and hit them in the referee's order.
-
-Run one of the three modes:
-    python mission2_and_5.py camera --camera 0
-    python mission2_and_5.py tune --camera 0
-    python mission2_and_5.py mission5 --order R-B-Y --camera 0
-
-All Mission 5 runtime tools are intentionally kept in this one file.
-
-The ROV starts PAUSED. Press SPACE to start moving.
-
-Keys (in the video window):
-    SPACE  start / pause autonomy (pause = all thrusters zero)
-    y      ball dropped -> move on to the next pole
-    n      ball did NOT drop -> retry the same pole
-    s      skip the current pole
-    r      restart the sequence from the first pole
-    m      show / hide the colour masks (for checking the HSV tuning)
-    q/ESC  quit
-
-For each pole the controller runs:
-    SEARCH  -> yaw on the spot until the target colour is seen for a few frames
-    REPOSITION -> nothing found after a full spin: drive forward a bit, search again
-    ALIGN   -> yaw until the pole is centred
-    APPROACH-> drive forward, keep steering onto the pole, slow down as it grows
-    HIT     -> short blind forward push (pole fills the view, can't track it)
-    BACK_OFF-> reverse away from the pole
-    CONFIRM -> stop and wait for 'y' / 'n' (or auto-confirm with --auto-confirm)
-"""
-
-import argparse
-import json
-import os
-import time
-from dataclasses import dataclass
-
-import cv2
-import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# Colour-pole detection
-# ---------------------------------------------------------------------------
-
-COLORS = ("red", "yellow", "blue")
-DRAW_BGR = {"red": (0, 0, 255), "yellow": (0, 220, 255), "blue": (255, 80, 0)}
-
-# These are the starting values for pool testing. If colors.json exists beside
-# this file, its values override these defaults. OpenCV HSV uses H 0-179 and
-# S/V 0-255. Red wraps around hue zero, which is why it needs two ranges.
-DEFAULT_CONFIG = {
-    "white_balance": True,
-    "blur_ksize": 5,
-    "min_area_frac": 0.001,
-    "max_area_frac": 0.90,
-    "min_aspect": 1.3,
-    "ranges": {
-        "red": [[[0, 110, 60], [8, 255, 255]], [[165, 110, 60], [179, 255, 255]]],
-        "yellow": [[[15, 100, 90], [40, 255, 255]]],
-        "blue": [[[100, 130, 50], [128, 255, 255]]],
-    },
-}
-
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "colors.json")
-
-
-@dataclass
-class Detection:
-    """What the detector knows about one pole in the current camera frame.
-
-    err_x/err_y tell the controller which way to steer. width_frac tells it
-    roughly how close the ROV is to the pole without needing a depth sensor.
-    """
-
-    color: str
-    bbox: tuple
-    center: tuple
-    area: float
-    err_x: float
-    err_y: float
-    height_frac: float
-    width_frac: float
-    area_frac: float
-    score: float
-
-
-def load_config(path=CONFIG_PATH):
-    """Load optional pool-tuned values while keeping defaults for missing keys."""
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    if path and os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            user = json.load(f)
-        ranges = user.pop("ranges", {})
-        cfg.update(user)
-        cfg["ranges"].update(ranges)
-    return cfg
-
-
-def save_config(cfg, path=CONFIG_PATH):
-    """Save HSV tuner values so the main interface can reuse them next time."""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-
-def white_balance_gains(bgr):
-    """Estimate per-channel gains that reduce the pool's blue/green color cast."""
-    sample = bgr[::4, ::4].reshape(-1, 3)
-    med = np.median(sample, axis=0).astype(np.float32)
-    gain = med.mean() / np.maximum(med, 1.0)
-    return np.clip(gain, 0.5, 3.0)
-
-
-def gray_world_white_balance(bgr, gain=None):
-    """Apply white-balance gains to a frame before looking for pole colors."""
-    if gain is None:
-        gain = white_balance_gains(bgr)
-    lut = np.clip(np.arange(256, dtype=np.float32)[:, None] * gain[None, :], 0, 255)
-    return cv2.LUT(bgr, lut.astype(np.uint8).reshape(1, 256, 3))
-
-
-class PoleDetector:
-    """Find the best red, yellow, and blue pole candidate in each frame."""
-
-    def __init__(self, config=None):
-        self.cfg = config if config is not None else load_config()
-        self._wb_gain = None
-        self._open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        self._close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 21))
-
-    def preprocess(self, bgr):
-        """Stabilize underwater color and soften camera noise before thresholding."""
-        if self.cfg.get("white_balance", True):
-            gain = white_balance_gains(bgr)
-            self._wb_gain = gain if self._wb_gain is None else 0.9 * self._wb_gain + 0.1 * gain
-            bgr = gray_world_white_balance(bgr, self._wb_gain)
-        ksize = int(self.cfg.get("blur_ksize", 5))
-        if ksize >= 3:
-            bgr = cv2.GaussianBlur(bgr, (ksize | 1, ksize | 1), 0)
-        return bgr
-
-    def mask(self, hsv, color):
-        """Build a black/white image where white pixels match one pole color."""
-        mask = None
-        for lower, upper in self.cfg["ranges"][color]:
-            part = cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8))
-            mask = part if mask is None else cv2.bitwise_or(mask, part)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._open_k)
-        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._close_k)
-
-    def detect(self, bgr, return_masks=False):
-        """Return one best Detection (or None) for every required pole color."""
-        height, width = bgr.shape[:2]
-        frame_area = float(height * width)
-        hsv = cv2.cvtColor(self.preprocess(bgr), cv2.COLOR_BGR2HSV)
-        results, masks = {}, {}
-        for color in COLORS:
-            mask = self.mask(hsv, color)
-            masks[color] = mask
-            results[color] = self._best_blob(mask, color, width, height, frame_area)
-        return (results, masks) if return_masks else results
-
-    def _best_blob(self, mask, color, width, height, frame_area):
-        """Reject tiny/wide noise and keep the blob that looks most like a pole."""
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            area_frac = area / frame_area
-            if area_frac < self.cfg["min_area_frac"] or area_frac > self.cfg["max_area_frac"]:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect = h / max(w, 1)
-            touches_edge = y <= 2 or y + h >= height - 2
-            if aspect < self.cfg["min_aspect"] and not touches_edge:
-                continue
-            solidity = area / max(w * h, 1)
-            score = area * (0.5 + solidity) * min(aspect, 6.0)
-            if best is None or score > best.score:
-                center_x, center_y = x + w / 2.0, y + h / 2.0
-                best = Detection(
-                    color=color,
-                    bbox=(x, y, w, h),
-                    center=(center_x, center_y),
-                    area=area,
-                    err_x=(center_x - width / 2.0) / (width / 2.0),
-                    err_y=(center_y - height / 2.0) / (height / 2.0),
-                    height_frac=h / float(height),
-                    width_frac=w / float(width),
-                    area_frac=area_frac,
-                    score=score,
-                )
-        return best
-
-
-def draw_detections(frame, detections, target=None):
-    """Show pole boxes and their width; the current target is drawn thicker."""
-    for color, detection in detections.items():
-        if detection is None:
-            continue
-        x, y, w, h = detection.bbox
-        thickness = 4 if color == target else 1
-        cv2.rectangle(frame, (x, y), (x + w, y + h), DRAW_BGR[color], thickness)
-        label = f"{color} w={detection.width_frac:.2f}"
-        cv2.putText(
-            frame,
-            label,
-            (x, max(15, y - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            DRAW_BGR[color],
-            2 if color == target else 1,
-        )
-    return frame
-
-LETTER_TO_COLOR = {"R": "red", "Y": "yellow", "B": "blue"}
-
-
-# ---------------------------------------------------------------------------
-# Mission 5 order, commands, and state machine
-# ---------------------------------------------------------------------------
-
-def parse_order(text):
-    """'R-B-Y' -> ['red', 'blue', 'yellow']. Also accepts 'rby', 'R B Y', 'R,B,Y'."""
-    letters = [ch for ch in text.upper() if ch.isalpha()]
-    if sorted(letters) != ["B", "R", "Y"]:
-        raise ValueError(f"order must use R, Y and B exactly once each, e.g. R-B-Y (got {text!r})")
-    return [LETTER_TO_COLOR[ch] for ch in letters]
-
-
-def order_str(order):
-    """Turn ['red', 'blue', 'yellow'] back into the referee format R-B-Y."""
-    return "-".join(c[0].upper() for c in order)
-
-
-@dataclass
-class Command:
-    """Normalised thrust request, each in -1..1. surge +forward, yaw +right, heave +down."""
-    surge: float = 0.0
-    yaw: float = 0.0
-    heave: float = 0.0
-
-
-def mission_command_to_axes(command):
-    """Map Mission 5 commands onto the control interface's axis convention.
-
-    Mission 5 uses positive heave for down, while the manual mixer uses
-    positive heave for up, so that axis is intentionally inverted.
-    """
-    return {
-        "surge": clamp(command.surge),
-        "sway": 0.0,
-        "heave": clamp(-command.heave),
-        "yaw": clamp(command.yaw),
-    }
-
-
-@dataclass
-class ControlParams:
-    """Mission 5 movement settings. Values marked TUNE should be tested in the pool."""
-
-    search_yaw: float = 0.25      # yaw speed while looking for the pole
-    search_turn_time: float = 30.0  # TUNE: ~time for one full 360 spin at search_yaw
-    reposition_surge: float = 0.4   # nothing found after a full spin -> move and retry
-    reposition_time: float = 3.0
-    confirm_frames: int = 3       # consecutive sightings needed to leave SEARCH
-    kp_yaw: float = 0.6           # yaw = kp_yaw * err_x
-    kp_heave: float = 0.0         # set > 0 to also centre vertically
-    align_tol: float = 0.15       # |err_x| below this -> start driving forward
-    realign_tol: float = 0.35     # |err_x| above this while approaching -> stop and re-align
-    approach_surge: float = 0.5   # forward speed when the pole is far away
-    min_surge: float = 0.2        # forward speed just before the hit
-    # Pole bbox width (fraction of frame width) at which we're close enough to hit.
-    # Height is no use for this: a 1 m pole fills the frame height from ~1 m away.
-    # TUNE: hold the ROV where the hitter just touches the pole, read w= on screen.
-    hit_width_frac: float = 0.12
-    hit_surge: float = 0.7
-    hit_time: float = 1.0         # seconds of blind forward push
-    backoff_surge: float = -0.4
-    backoff_time: float = 2.0
-    lost_timeout: float = 1.0     # seconds without the pole before going back to SEARCH
-
-
-class MissionController:
-    """Mission 5 decision maker.
-
-    It never talks to motors directly. update() only returns a safe, normalized
-    Command; the shared interface handles arming, speed limits, and serial output.
-    """
-
-    SEARCH, REPOSITION, ALIGN, APPROACH, HIT, BACK_OFF, CONFIRM, DONE = (
-        "SEARCH", "REPOSITION", "ALIGN", "APPROACH", "HIT", "BACK_OFF", "CONFIRM", "DONE")
-
-    def __init__(self, order, params=None, auto_confirm=False):
-        self.order = list(order)
-        self.p = params or ControlParams()
-        self.auto_confirm = auto_confirm
-        self.reset()
-
-    def reset(self):
-        """Go back to the first pole and clear results from the previous attempt."""
-        self.index = 0
-        self.results = {}           # color -> "hit" | "skipped"
-        self._enter(self.SEARCH, None)  # timer starts on the first update()
-        self._last_seen = None
-        self._last_side = 1.0       # turn towards where the pole was last seen
-        self._seen_count = 0
-
-    @property
-    def target(self):
-        """The pole color currently being attempted, or None when all are done."""
-        return self.order[self.index] if self.index < len(self.order) else None
-
-    def _enter(self, state, now):
-        """Change state and remember when it began for timed actions."""
-        self.state = state
-        self.state_since = now
-
-    def _next_target(self, now, result):
-        """Record hit/skipped for this pole and advance to the next color."""
-        self.results[self.target] = result
-        self.index += 1
-        self._seen_count = 0
-        self._last_seen = None
-        self._enter(self.DONE if self.target is None else self.SEARCH, now)
-
-    # operator input -------------------------------------------------------
-    def confirm(self, dropped, now):
-        """Operator says whether the ball dropped. Only meaningful after a hit."""
-        if self.state not in (self.CONFIRM, self.BACK_OFF, self.HIT):
-            return
-        if dropped:
-            self._next_target(now, "hit")
-        else:
-            self._seen_count = 0
-            self._enter(self.SEARCH, now)
-
-    def resume(self):
-        """Call when un-pausing so time spent paused doesn't count towards timers."""
-        self.state_since = None
-        self._last_seen = None
-
-    def skip(self, now):
-        """Mark the current pole skipped so a run can continue after a problem."""
-        if self.target is not None:
-            self._next_target(now, "skipped")
-
-    # main step --------------------------------------------------------------
-    def update(self, detections, now):
-        """Advance the state machine once and return the movement wanted now."""
-        p = self.p
-        det = detections.get(self.target) if self.target else None
-        if det is not None:
-            self._last_seen = now
-            self._last_side = 1.0 if det.err_x >= 0 else -1.0
-            self._seen_count += 1
-        else:
-            self._seen_count = 0
-        if self.state_since is None:
-            self.state_since = now
-        elapsed = now - self.state_since
-
-        if self.state == self.DONE:
-            return Command()
-
-        # HIT and BACK_OFF are timed because the pole may disappear from view
-        # once it is close enough to touch the front of the ROV.
-        if self.state == self.HIT:
-            if elapsed >= p.hit_time:
-                self._enter(self.BACK_OFF, now)
-            return Command(surge=p.hit_surge)
-
-        if self.state == self.BACK_OFF:
-            if elapsed >= p.backoff_time:
-                if self.auto_confirm:
-                    self._next_target(now, "hit")
-                else:
-                    self._enter(self.CONFIRM, now)
-                return Command()
-            return Command(surge=p.backoff_surge)
-
-        if self.state == self.CONFIRM:
-            return Command()
-
-        # SEARCH turns in place. After a full turn, REPOSITION moves to a new
-        # patch of water so we do not keep searching from the same blind spot.
-        if self.state in (self.SEARCH, self.REPOSITION):
-            if det is not None and self._seen_count >= p.confirm_frames:
-                self._enter(self.ALIGN, now)
-            elif self.state == self.SEARCH:
-                if elapsed >= p.search_turn_time:
-                    self._enter(self.REPOSITION, now)
-                    return Command(surge=p.reposition_surge)
-                return Command(yaw=p.search_yaw * self._last_side)
-            else:
-                if elapsed >= p.reposition_time:
-                    self._enter(self.SEARCH, now)
-                    return Command()
-                return Command(surge=p.reposition_surge)
-
-        # ALIGN / APPROACH need the pole in view. A very short dropout is
-        # ignored, but a longer loss sends us back to SEARCH.
-        if det is None:
-            if self._last_seen is None or now - self._last_seen > p.lost_timeout:
-                self._enter(self.SEARCH, now)
-                return Command(yaw=p.search_yaw * self._last_side)
-            return Command()  # brief dropout: hold still and wait
-
-        yaw = clamp(p.kp_yaw * det.err_x)
-        heave = clamp(p.kp_heave * det.err_y)
-
-        if self.state == self.ALIGN:
-            if abs(det.err_x) < p.align_tol:
-                self._enter(self.APPROACH, now)
-            else:
-                return Command(yaw=yaw, heave=heave)
-
-        # APPROACH keeps steering while moving forward. Pole width is used as
-        # the distance cue: a wider pole means it is closer to the camera.
-        if det.width_frac >= p.hit_width_frac:
-            self._enter(self.HIT, now)
-            return Command(surge=p.hit_surge)
-        if abs(det.err_x) > p.realign_tol:
-            self._enter(self.ALIGN, now)
-            return Command(yaw=yaw, heave=heave)
-        # slow down linearly as the pole fills more of the frame
-        closeness = clamp(det.width_frac / p.hit_width_frac, 0.0, 1.0)
-        surge = p.approach_surge + (p.min_surge - p.approach_surge) * closeness
-        return Command(surge=surge, yaw=yaw, heave=heave)
-
-
-# ---------------------------------------------------------------------------
-# Mission 5 standalone OpenCV runtime
-# ---------------------------------------------------------------------------
-
-class ConsoleRov:
-    """Stand-in for the real thruster link: prints commands when they change.
-
-    To drive the real ROV, write a class with the same send()/stop() methods that
-    maps Command.surge / yaw / heave onto your thrusters (e.g. pymavlink
-    manual_control for ArduSub, or PWM values over serial to your controller)."""
-
-    def __init__(self, min_period=0.3):
-        self.min_period = min_period
-        self._last = None
-        self._last_t = 0.0
-
-    def send(self, cmd):
-        key = (round(cmd.surge, 2), round(cmd.yaw, 2), round(cmd.heave, 2))
-        now = time.monotonic()
-        if key != self._last and now - self._last_t >= self.min_period:
-            print(f"CMD surge={cmd.surge:+.2f} yaw={cmd.yaw:+.2f} heave={cmd.heave:+.2f}")
-            self._last, self._last_t = key, now
-
-    def stop(self):
-        self.send(Command())
-
-
-def draw_hud(frame, ctrl, cmd, running, fps):
-    """Add status and alignment guides to the standalone Mission 5 window."""
-    H, W = frame.shape[:2]
-    p = ctrl.p
-    # centre line and align tolerance band
-    cv2.line(frame, (W // 2, 0), (W // 2, H), (200, 200, 200), 1)
-    for s in (-1, 1):
-        x = int(W / 2 + s * p.align_tol * W / 2)
-        cv2.line(frame, (x, 0), (x, H), (120, 120, 120), 1)
-    # hit threshold: when the target box is this wide, the ROV goes for the hit
-    half = int(p.hit_width_frac * W / 2)
-    cv2.line(frame, (W // 2 - half, H - 30), (W // 2 + half, H - 30), (0, 255, 0), 3)
-
-    parts = []
-    for i, c in enumerate(ctrl.order):
-        mark = {"hit": "[x]", "skipped": "[-]"}.get(ctrl.results.get(c), "[>]" if i == ctrl.index else "[ ]")
-        parts.append(f"{mark}{c[0].upper()}")
-    lines = [
-        f"ORDER {order_str(ctrl.order)}   " + " ".join(parts),
-        f"TARGET {ctrl.target.upper() if ctrl.target else '-'}   STATE {ctrl.state}",
-        f"surge {cmd.surge:+.2f}  yaw {cmd.yaw:+.2f}  heave {cmd.heave:+.2f}   {fps:4.1f} fps",
-    ]
-    if ctrl.state == ctrl.CONFIRM:
-        lines.append("Did the ball drop?  y = yes   n = retry")
-    if not running:
-        lines.append("PAUSED - press SPACE to start")
-    y = 22
-    for i, text in enumerate(lines):
-        color = (0, 0, 255) if text.startswith("PAUSED") else (0, 255, 255) if "ball" in text else (255, 255, 255)
-        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
-        y += 22
-    if ctrl.target:
-        cv2.rectangle(frame, (W - 40, 10), (W - 18, 32), DRAW_BGR[ctrl.target], -1)
-    help_text = "SPACE start/pause  y/n confirm  s skip  r restart  m masks  q quit"
-    cv2.putText(frame, help_text, (10, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    return frame
-
-
-def draw_interface_mission_hud(frame, ctrl, cmd, armed, running, fps):
-    """Draw Mission 5 status using controls that match the Pygame interface."""
-    height, width = frame.shape[:2]
-    target = ctrl.target
-    if target:
-        # The detailed width remains next to the target bounding box; this line
-        # keeps the control state visible even while the pole is off-screen.
-        target_text = target.upper()
-    else:
-        target_text = "-"
-    lines = [
-        f"M5 {'RUNNING' if running else 'PAUSED'}  "
-        f"{'ARMED' if armed else 'DISARMED'}  STATE {ctrl.state}",
-        f"ORDER {order_str(ctrl.order)}  TARGET {target_text}",
-        f"surge {cmd.surge:+.2f}  yaw {cmd.yaw:+.2f}  "
-        f"heave {cmd.heave:+.2f}  {fps:4.1f} fps",
-    ]
-    if ctrl.state == ctrl.CONFIRM:
-        lines.append("Ball dropped? Y=yes  N=retry  K=skip")
-    elif not running:
-        lines.append("Space arm/disarm  F6 autonomy start/pause")
-    y = 22
-    for text in lines:
-        color = (0, 255, 120) if running else (0, 220, 255)
-        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.52, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.52, color, 1, cv2.LINE_AA)
-        y += 21
-    cv2.line(frame, (width // 2, 0), (width // 2, height), (200, 200, 200), 1)
-    return frame
-
-
-def mask_view(masks, size):
-    """Combine the three black/white colour masks into one debugging strip."""
-    W, H = size
-    tiles = []
-    for c in COLORS:
-        t = cv2.cvtColor(cv2.resize(masks[c], (W // 3, H // 3)), cv2.COLOR_GRAY2BGR)
-        cv2.putText(t, c, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, DRAW_BGR[c], 2)
-        tiles.append(t)
-    strip = cv2.hconcat(tiles)
-    return cv2.resize(strip, (W, strip.shape[0]))  # 3 * (W // 3) may be short of W
-
-
-def open_source(src):
-    """Open a camera number or video file, preferring the fast Windows backend."""
-    source = str(src)
-    if source.isdigit():
-        cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)  # DSHOW opens fast on Windows
-        if not cap.isOpened():
-            cap.release()
-            cap = cv2.VideoCapture(int(source))
-    else:
-        cap = cv2.VideoCapture(source)
-    return cap
-
-
-def run_camera_test(camera):
-    """Open one camera at a time and show its raw live feed."""
-    cap = open_source(camera)
-    if not cap.isOpened():
-        cap.release()
-        raise SystemExit(f"Could not open camera {camera!r}")
-
-    print(f"Camera {camera} is working. Press Q to quit.")
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("Could not read a frame from the camera.")
-                break
-            cv2.imshow("Mission 5 - Camera Test", frame)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-                break
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-
-
-TUNER_WINDOW = "Mission 5 - HSV Tuner"
-TUNER_SLIDERS = ("H min", "H max", "S min", "S max", "V min", "V max")
-
-
-def _set_tuner_sliders(color_range):
-    """Move the HSV tuner controls to match the selected colour's saved range."""
-    (h0, s0, v0), (h1, s1, v1) = color_range
-    for name, value in zip(TUNER_SLIDERS, (h0, h1, s0, s1, v0, v1)):
-        cv2.setTrackbarPos(name, TUNER_WINDOW, int(value))
-
-
-def _read_tuner_sliders():
-    """Read the six HSV controls and return one lower/upper threshold pair."""
-    h0, h1, s0, s1, v0, v1 = (
-        cv2.getTrackbarPos(name, TUNER_WINDOW) for name in TUNER_SLIDERS
-    )
-    return [[h0, s0, v0], [h1, s1, v1]]
-
-
-def run_hsv_tuner(camera):
-    """Tune red/yellow/blue HSV ranges using the live camera."""
-    config = load_config()
-    detector = PoleDetector(config)
-    cap = open_source(camera)
-    if not cap.isOpened():
-        cap.release()
-        raise SystemExit(f"Could not open camera/video {camera!r}")
-
-    cv2.namedWindow(TUNER_WINDOW)
-    for name in TUNER_SLIDERS:
-        maximum = 179 if name.startswith("H") else 255
-        cv2.createTrackbar(name, TUNER_WINDOW, 0, maximum, lambda _value: None)
-
-    current = "red"
-    _set_tuner_sliders(config["ranges"][current][0])
-    state = {"click": None}
-
-    def on_mouse(event, x, y, _flags, _param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            state["click"] = (x, y)
-
-    cv2.setMouseCallback(TUNER_WINDOW, on_mouse)
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("Could not read a frame from the camera.")
-                break
-            hsv = cv2.cvtColor(detector.preprocess(frame), cv2.COLOR_BGR2HSV)
-
-            if state["click"] is not None:
-                x, y = state["click"]
-                state["click"] = None
-                if y < hsv.shape[0] and x < hsv.shape[1]:
-                    patch = hsv[max(0, y - 5):y + 6, max(0, x - 5):x + 6].reshape(-1, 3)
-                    hue, saturation, value = np.median(patch, axis=0).astype(int)
-                    print(f"Clicked HSV = ({hue}, {saturation}, {value})")
-                    if current == "red" and hue > 90:
-                        hue = 179 - hue
-                    _set_tuner_sliders([
-                        [max(0, hue - 8), max(0, saturation - 60), max(0, value - 70)],
-                        [min(179, hue + 8), 255, 255],
-                    ])
-
-            color_range = _read_tuner_sliders()
-            if current == "red":
-                lower, upper = color_range
-                config["ranges"]["red"] = [
-                    color_range,
-                    [[179 - upper[0], lower[1], lower[2]], [179, upper[1], upper[2]]],
-                ]
-            else:
-                config["ranges"][current] = [color_range]
-
-            mask = detector.mask(hsv, current)
-            detection = detector.detect(frame)[current]
-            view = frame.copy()
-            if detection is not None:
-                x, y, w, h = detection.bbox
-                cv2.rectangle(view, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            status = (
-                f"Editing {current.upper()}  1/2/3 switch  S save  "
-                f"WB={'on' if config['white_balance'] else 'off'}"
-            )
-            cv2.putText(view, status, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (0, 255, 255), 2)
-            cv2.imshow(TUNER_WINDOW, cv2.hconcat([view, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)]))
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if key in (ord("1"), ord("2"), ord("3")):
-                current = COLORS[key - ord("1")]
-                _set_tuner_sliders(config["ranges"][current][0])
-            elif key == ord("w"):
-                config["white_balance"] = not config["white_balance"]
-            elif key == ord("s"):
-                save_config(config)
-                print("Saved", CONFIG_PATH)
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-
-
-def run_mission(args):
-    """Run Mission 5 in its standalone OpenCV window (without the Pygame UI)."""
-
-    while True:
-        try:
-            order = parse_order(args.order or input("Referee order (e.g. R-B-Y): "))
-            break
-        except ValueError as e:
-            print(e)
-            args.order = None
-    print("Order:", " -> ".join(order))
-
-    cap = open_source(args.camera)
-    if not cap.isOpened():
-        raise SystemExit(f"Could not open camera/video {args.camera!r}")
-
-    detector = PoleDetector(load_config())
-    ctrl = MissionController(order, auto_confirm=args.auto_confirm or args.no_gui)
-    rov = ConsoleRov()
-    running = args.no_gui
-    show_masks = False
-    writer = None
-    fps, t_prev = 0.0, time.monotonic()
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("Camera/video ended.")
-                break
-            if args.record:
-                if writer is None:
-                    h, w = frame.shape[:2]
-                    writer = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"mp4v"), 20, (w, h))
-                writer.write(frame)
-
-            now = time.monotonic()
-            fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-3)
-            t_prev = now
-
-            detections, masks = detector.detect(frame, return_masks=True)
-            cmd = ctrl.update(detections, now) if running else Command()
-            rov.send(cmd)
-
-            if args.no_gui:
-                if ctrl.state == ctrl.DONE:
-                    print("Sequence complete:", ctrl.results)
-                    break
-                continue
-
-            view = draw_detections(frame.copy(), detections, ctrl.target)
-            draw_hud(view, ctrl, cmd, running, fps)
-            if show_masks:
-                view = cv2.vconcat([view, mask_view(masks, (view.shape[1], view.shape[0]))])
-            cv2.imshow("Mission 5", view)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            elif key == ord(" "):
-                running = not running
-                if running:
-                    ctrl.resume()
-                print("RUNNING" if running else "PAUSED")
-            elif key == ord("y"):
-                ctrl.confirm(True, now)
-            elif key == ord("n"):
-                ctrl.confirm(False, now)
-            elif key == ord("s"):
-                ctrl.skip(now)
-            elif key == ord("r"):
-                ctrl.reset()
-                print("Sequence restarted")
-            elif key == ord("m"):
-                show_masks = not show_masks
-    except KeyboardInterrupt:
-        pass
-    finally:
-        rov.stop()
-        cap.release()
-        if writer is not None:
-            writer.release()
-        cv2.destroyAllWindows()
-        print("Results:", ctrl.results)
-
-
-def build_mission5_parser():
-    """Describe command-line options used by camera, tuner, and Mission 5 modes."""
-    parser = argparse.ArgumentParser(
-        description="Mission 5 camera test, colour tuning, and pole-hitting controller"
-    )
-    parser.add_argument(
-        "--mode",
-        choices=("camera", "tune", "mission"),
-        default="mission",
-        help="camera = raw feed, tune = HSV tuner, mission = controller (default)",
-    )
-    parser.add_argument("--camera", default="0", help="camera index or video path (default 0)")
-    parser.add_argument("--order", help="referee order, e.g. R-B-Y (asked for if omitted)")
-    parser.add_argument("--auto-confirm", action="store_true",
-                        help="assume the ball dropped after each hit")
-    parser.add_argument("--record", help="save raw mission camera video to this .mp4")
-    parser.add_argument("--no-gui", action="store_true",
-                        help="mission without a window; starts immediately")
-    return parser
-
-
-def run_mission5_modes(argv=None):
-    """Send the requested standalone mode to its camera, tuner, or mission runner."""
-    args = build_mission5_parser().parse_args(argv)
-    if args.mode == "camera":
-        run_camera_test(args.camera)
-    elif args.mode == "tune":
-        run_hsv_tuner(args.camera)
-    else:
-        run_mission(args)
-
-# =============================================================================
-# Mission 2 and Mission 5 command-line entrypoint
-# =============================================================================
-
-
-def main(argv=None):
-    """Choose the combined interface or one of the standalone camera tools."""
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    commands = {"control", "mission2", "mission5", "camera", "tune"}
-    command = arguments.pop(0) if arguments and arguments[0] in commands else "control"
-
-    if command in ("control", "mission2"):
-        run_control_interface(arguments)
-    else:
-        mode = {"mission5": "mission", "camera": "camera", "tune": "tune"}[command]
-        run_mission5_modes(["--mode", mode, *arguments])
 
 
 if __name__ == "__main__":

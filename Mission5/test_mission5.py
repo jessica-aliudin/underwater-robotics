@@ -1,4 +1,4 @@
-"""Tests for Missions 2 and 5. Run:  python -m unittest -v test_mission2_and_5
+"""Tests for Mission 5. Run:  python -m unittest -v test_mission5
 
 - order parsing
 - detector on synthetic underwater images (blue-green cast, noise, decoys)
@@ -15,17 +15,8 @@ import unittest
 import cv2
 import numpy as np
 
-from mission2_and_5 import (
-    DEFAULT_CONFIG,
-    Command,
-    ControlParams,
-    Detection,
-    MissionController,
-    PoleDetector,
-    mission_command_to_axes,
-    parse_camera_source,
-    parse_order,
-)
+from mission5 import Command, ControlParams, MissionController, parse_order
+from pole_detector import DEFAULT_CONFIG, Detection, PoleDetector
 
 W, H = 640, 480
 # How poles might look through murky blue-green water (BGR)
@@ -67,20 +58,6 @@ class TestParseOrder(unittest.TestCase):
         for bad in ["R-R-Y", "R-B", "R-B-Y-G", "", "R-G-B"]:
             with self.assertRaises(ValueError, msg=bad):
                 parse_order(bad)
-
-
-class TestCameraSource(unittest.TestCase):
-    def test_camera_indices_are_integers(self):
-        self.assertEqual(parse_camera_source("0"), 0)
-        self.assertEqual(parse_camera_source(" 5 "), 5)
-
-    def test_demo_and_video_paths_remain_strings(self):
-        self.assertEqual(parse_camera_source("DEMO"), "demo")
-        self.assertEqual(parse_camera_source("pool_run.mp4"), "pool_run.mp4")
-
-    def test_empty_source_is_rejected(self):
-        with self.assertRaises(ValueError):
-            parse_camera_source("   ")
 
 
 class TestDetector(unittest.TestCase):
@@ -131,13 +108,6 @@ def fake_det(color, err_x=0.0, width_frac=0.03):
 
 
 class TestController(unittest.TestCase):
-    def test_command_maps_to_interface_axes(self):
-        axes = mission_command_to_axes(Command(surge=0.4, yaw=-0.2, heave=0.3))
-        self.assertEqual(
-            axes,
-            {"surge": 0.4, "sway": 0.0, "heave": -0.3, "yaw": -0.2},
-        )
-
     def test_full_cycle_for_one_pole(self):
         ctrl = MissionController(["blue", "red", "yellow"])
         t = 0.0
