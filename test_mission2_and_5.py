@@ -1,4 +1,4 @@
-"""Tests for Mission 5. Run:  python -m unittest -v test_all_missions
+"""Tests for Missions 2 and 5. Run:  python -m unittest -v test_mission2_and_5
 
 - order parsing
 - detector on synthetic underwater images (blue-green cast, noise, decoys)
@@ -15,7 +15,7 @@ import unittest
 import cv2
 import numpy as np
 
-from all_missions import (
+from mission2_and_5 import (
     DEFAULT_CONFIG,
     Command,
     ControlParams,

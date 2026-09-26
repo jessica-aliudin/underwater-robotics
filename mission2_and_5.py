@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-"""Unified underwater-robotics application for Missions 1, 2, and 5.
+"""Unified underwater-robotics application for Missions 2 and 5.
 
 Examples:
-    python all_missions.py control --dry-run --camera demo
-    python all_missions.py mission1 --url http://ROV_TOWER_IP:8000/message.txt
-    python all_missions.py mission2 --dry-run --camera 0
-    python all_missions.py camera --camera 0
-    python all_missions.py tune --camera 0
-    python all_missions.py mission5 --order R-B-Y --camera 0
+    python mission2_and_5.py control --dry-run --camera demo
+    python mission2_and_5.py mission2 --dry-run --camera 0
+    python mission2_and_5.py camera --camera 0
+    python mission2_and_5.py tune --camera 0
+    python mission2_and_5.py mission5 --order R-B-Y --camera 0
 
-Run without a command to open the combined Mission 1/2 topside controller.
+Run without a command to open the combined Mission 2/5 topside controller.
 """
 
 """
-rov_control.py - topside control program for the CityUHK UR Fall Training 2026 ROV.
+mission2_and_5.py - topside control program for the CityUHK UR Fall Training 2026 ROV.
 
 One window with:
   * live camera feed with AprilTag and colour-detection overlays
   * gamepad or keyboard driving, with arming, speed steps and a hook toggle
   * thruster output bars
-  * Mission 1:   send the Wi-Fi details to the ESP32 and show the text it retrieves
   * Mission 2.1: remembers every AprilTag seen, picks the largest/smallest ID,
                  and keeps the clearest photo of each tag
   * Gallery (G): photos of the LOWEST and HIGHEST tag IDs side by side, plus
@@ -32,11 +30,11 @@ Install (Python 3.9+):
     (OpenCV 4.7 or newer is needed for the AprilTag detector.)
 
 Run:
-    python rov_control.py --camera demo --dry-run   no hardware at all: fake tags, nothing sent
-    python rov_control.py --dry-run                 laptop webcam, commands shown but not sent
-    python rov_control.py --port COM3 --camera 1    real ROV on COM3, USB camera number 1
-    python rov_control.py --camera pool_run.mp4     replay a recorded video
-    python rov_control.py --list-ports              list serial ports and exit
+    python mission2_and_5.py --camera demo --dry-run   no hardware at all: fake tags, nothing sent
+    python mission2_and_5.py --dry-run                 laptop webcam, commands shown but not sent
+    python mission2_and_5.py --port COM3 --camera 1    real ROV on COM3, USB camera number 1
+    python mission2_and_5.py --camera pool_run.mp4     replay a recorded video
+    python mission2_and_5.py --list-ports              list serial ports and exit
 
 Photos are saved in ./captures/<date_time>/ :
     tag_007.jpg, tag_023.jpg, ...   clearest photo of each tag ID
@@ -48,11 +46,8 @@ Serial protocol (text lines, 115200 baud). Your ESP32 firmware must match this:
     T,<armed>,<hook>,<t1>,...,<tN>     about 30 times per second
                                        armed: 0/1   hook: 0 = closed, 1 = open
                                        thrusters: -100..100 percent, 0 = stop
-    WIFI\t<ssid>\t<password>\t<url>    Mission 1 settings (tab-separated)
-    FETCH                              ESP32 joins the Wi-Fi, does an HTTP GET, replies MSG
     ORDER\t<R-B-Y>                     Mission 5 pole order
   ROV -> laptop
-    MSG\t<text>                        the text the ESP32 retrieved (Mission 1)
     LOG\t<text>                        status messages, shown in the log panel
   FAILSAFE (firmware side): if no T line arrives for 500 ms, stop every thruster.
 """
@@ -185,8 +180,6 @@ HELP_LEFT = [
 ]
 HELP_RIGHT = [
     ("Missions", None),
-    ("F2", "Mission 1: enter Wi-Fi, fetch"),
-    ("F4", "Mission 1: fetch again"),
     ("M", "Mission 2.1: largest or smallest"),
     ("T", "AprilTag detection on / off"),
     ("G", "gallery: lowest/highest tags"),
@@ -257,17 +250,6 @@ def cv_to_surface(image, size):
 
 def fmt_ids(ids):
     return ", ".join(str(i) for i in ids) if ids else "-"
-
-
-def validate_not_empty(text):
-    return None if text.strip() else "This cannot be empty"
-
-
-def validate_url(text):
-    t = text.strip()
-    if not t.lower().startswith(("http://", "https://")) or len(t) <= len("http://") or " " in t:
-        return "Enter the full address from the referee, e.g. http://192.168.1.10/"
-    return None
 
 
 def validate_order(text):
@@ -724,7 +706,7 @@ class SerialLink:
 
 
 # =============================================================================
-# Text entry box (Wi-Fi details, pole order)
+# Text entry box (pole order and camera source)
 # =============================================================================
 
 class Prompt:
@@ -804,7 +786,6 @@ class App:
         self.show_help = False
         self.prompt = None
         self.reset_pressed_at = 0.0
-        self.wifi = None
         self.pole_order = ""
         self.mission_detector = PoleDetector(load_config())
         self.mission_controller = None
@@ -813,7 +794,6 @@ class App:
         self.mission_detections = {}
         self.mission_last_frame_at = None
         self.mission_complete_logged = False
-        self.wifi_message = ""
         self.joystick = None
         self.cmd = {axis: 0.0 for axis in AXES_ORDER}
         self.thrust = [0] * len(THRUSTERS)
@@ -908,9 +888,7 @@ class App:
         self.serial.send(self.last_sent)
 
     def on_serial_connect(self):
-        # The ESP32 may have rebooted, so send the mission settings again.
-        if self.wifi:
-            self.serial.send("WIFI\t" + "\t".join(self.wifi))
+        # The controller may have rebooted, so send the mission settings again.
         if self.pole_order:
             self.serial.send("ORDER\t" + self.pole_order)
 
@@ -919,10 +897,7 @@ class App:
 
     def handle_serial_lines(self):
         for line in self.serial.poll():
-            if line.startswith("MSG\t"):
-                self.wifi_message = line[4:]
-                self.log("Wi-Fi message received from the ROV")
-            elif line.startswith("LOG\t"):
+            if line.startswith("LOG\t"):
                 self.log("ROV: " + line[4:])
             elif line:
                 self.log("ROV: " + line)
@@ -1075,8 +1050,6 @@ class App:
                 self.log(f"Colour detection {'on' if self.colours_on else 'off'}")
         elif k == pygame.K_p:
             self.save_photo()
-        elif k == pygame.K_F2:
-            self.open_wifi_prompt()
         elif k == pygame.K_F3:
             self.prompt = Prompt("Mission 5 pole order",
                                  [("Order from the referee, e.g. R-B-Y", self.pole_order, validate_order)],
@@ -1099,11 +1072,6 @@ class App:
             self.log("Mission 5 restarted")
         elif k == pygame.K_F8:
             self.open_camera_prompt()
-        elif k == pygame.K_F4:
-            if self.wifi is None:
-                self.log("Enter the Wi-Fi details first (F2)")
-            else:
-                self.send_text("FETCH")
         elif k == pygame.K_F5:
             now = time.time()
             if now - self.reset_pressed_at < 2.0:
@@ -1219,27 +1187,6 @@ class App:
         self.colours_in_view = []
         self._cache.clear()
         self.log(f"Camera switched to {selection}")
-
-    def open_wifi_prompt(self):
-        ssid, password, url = self.wifi or (
-            "YOUR_WIFI_SSID",
-            "",
-            "http://ROV_TOWER_IP:8000/message.txt",
-        )
-        fields = [
-            ("Wi-Fi name (SSID)", ssid, validate_not_empty),
-            ("Wi-Fi password", password, None),
-            ("Server address from the referee", url, validate_url),
-        ]
-        self.prompt = Prompt("Mission 1 Wi-Fi details", fields, self.apply_wifi)
-
-    def apply_wifi(self, values):
-        ssid, password, url = values
-        self.wifi = (ssid, password, url.strip())
-        self.wifi_message = ""
-        self.log(f"Sending Wi-Fi details for {ssid} and asking the ROV to fetch")
-        self.send_text("WIFI\t" + "\t".join(self.wifi))
-        self.send_text("FETCH")
 
     def apply_order(self, values):
         order = parse_order(values[0])
@@ -1460,16 +1407,6 @@ class App:
                   GOOD if target is not None else MUTED, self.font_bold)
         y += 19
 
-        y = self.section(x, y + 6, w, "Wi-Fi message (Mission 1)")
-        if self.wifi_message:
-            for line in self.wrap(self.wifi_message, w, self.font)[:3]:
-                self.text(line, x, y, TEXT, max_width=w)
-                y += 19
-        else:
-            hint = "Waiting for the ROV (F4 fetches again)" if self.wifi else "Press F2 to enter the Wi-Fi details"
-            self.text(hint, x, y, MUTED, max_width=w)
-            y += 19
-
         y = self.section(x, y + 6, w, "Poles (Mission 5)")
         self.text(f"Order: {self.pole_order or '- (press F3)'}", x, y, max_width=w)
         y += 19
@@ -1509,7 +1446,7 @@ class App:
     def draw_bottom_bar(self):
         y = WIN_H - 24
         hints = ("F1 help   Space arm/disarm   X disarm   G gallery   P photo   "
-                 "F2 Wi-Fi   F3 order   F6 autonomy   F8 camera   Ctrl+Q quit")
+                 "F3 order   F6 autonomy   F8 camera   Ctrl+Q quit")
         self.text(hints, 12, y, MUTED, self.font_small)
         right = f"UI {self.clock.get_fps():.0f} fps"
         if self.serial.dry_run:
@@ -2352,44 +2289,17 @@ def run_mission5_modes(argv=None):
         run_mission(args)
 
 # =============================================================================
-# Unified command-line entrypoint
+# Mission 2 and Mission 5 command-line entrypoint
 # =============================================================================
-
-def run_mission1_fetch(argv=None):
-    """Fetch the Mission 1 tower message directly from the topside computer."""
-    import urllib.error
-    import urllib.request
-
-    parser = argparse.ArgumentParser(description="Mission 1 tower-data fetch")
-    parser.add_argument(
-        "--url",
-        required=True,
-        help="tower endpoint, e.g. http://192.168.1.10:8000/message.txt",
-    )
-    parser.add_argument("--timeout", type=float, default=5.0)
-    args = parser.parse_args(argv)
-
-    try:
-        with urllib.request.urlopen(args.url, timeout=args.timeout) as response:
-            payload = response.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise SystemExit(f"Mission 1 fetch failed: {exc}") from exc
-
-    print("==========================================")
-    print(">>> RETRIEVED MISSION DATA <<<")
-    print(payload)
-    print("==========================================")
 
 
 def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
-    commands = {"control", "mission1", "mission2", "mission5", "camera", "tune"}
+    commands = {"control", "mission2", "mission5", "camera", "tune"}
     command = arguments.pop(0) if arguments and arguments[0] in commands else "control"
 
     if command in ("control", "mission2"):
         run_control_interface(arguments)
-    elif command == "mission1":
-        run_mission1_fetch(arguments)
     else:
         mode = {"mission5": "mission", "camera": "camera", "tune": "tune"}[command]
         run_mission5_modes(["--mode", mode, *arguments])
